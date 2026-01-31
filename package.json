@@ -7,6 +7,14 @@
   "files": [
     "dist"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/YuanG1944/lark-bot-bridge-opencode-plugin"
+  },
+  "bugs": {
+    "url": "https://github.com/YuanG1944/lark-bot-bridge-opencode-plugin/issues"
+  },
+  "homepage": "https://github.com/YuanG1944/lark-bot-bridge-opencode-plugin",
   "scripts": {
     "build": "tsc",
     "prepublishOnly": "npm run build"
