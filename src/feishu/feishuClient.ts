@@ -1,18 +1,35 @@
+// src/feishu/feishuClient.ts
 import * as lark from '@larksuiteoapi/node-sdk';
 import * as http from 'http';
 import * as crypto from 'crypto';
-import type { FeishuConfig } from './types';
 
-const globalState = globalThis as any;
-const processedMessageIds = globalState.__feishu_processed_ids || new Set<string>();
+import type { FeishuConfig, IncomingMessageHandler } from '../types';
+import { globalState } from '../utils';
+
+function clip(s: string, n = 2000) {
+  if (!s) return '';
+  return s.length > n ? s.slice(0, n) + ` ... (clipped, len=${s.length})` : s;
+}
+function looksLikeJsonCard(s: string) {
+  const trimmed = s.trim();
+  // 必须以 { 开头，} 结尾，且包含 elements 或 header 关键字，才是飞书卡片
+  if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return false;
+
+  try {
+    const obj = JSON.parse(trimmed);
+    // 飞书卡片特征：必须是对象，通常有 elements 数组
+    return (
+      !!obj &&
+      typeof obj === 'object' &&
+      (Array.isArray((obj as any).elements) || (obj as any).card_link)
+    );
+  } catch {
+    return false;
+  }
+}
+
+const processedMessageIds: Set<string> = globalState.__feishu_processed_ids || new Set<string>();
 globalState.__feishu_processed_ids = processedMessageIds;
-
-type MessageHandler = (
-  chatId: string,
-  text: string,
-  messageId: string,
-  senderId: string,
-) => Promise<void>;
 
 function decryptEvent(encrypted: string, encryptKey: string): string {
   const key = crypto.createHash('sha256').update(encryptKey).digest();
@@ -34,12 +51,11 @@ export class FeishuClient {
   constructor(config: FeishuConfig) {
     this.config = config;
     this.apiClient = new lark.Client({
-      appId: config.appId,
-      appSecret: config.appSecret,
+      appId: config.app_id,
+      appSecret: config.app_secret,
     });
   }
 
-  // --- Helpers ---
   private isMessageProcessed(messageId: string): boolean {
     if (processedMessageIds.has(messageId)) {
       console.log(`[Feishu] 🚫 Ignoring duplicate message ID: ${messageId}`);
@@ -47,7 +63,7 @@ export class FeishuClient {
     }
     processedMessageIds.add(messageId);
     if (processedMessageIds.size > 2000) {
-      const first = processedMessageIds.values().next().value;
+      const first = processedMessageIds.values().next().value || '';
       processedMessageIds.delete(first);
     }
     return false;
@@ -72,106 +88,99 @@ export class FeishuClient {
     }
   }
 
-  /**
-   * 构造 Markdown 卡片 JSON
-   */
   private makeCard(text: string): string {
+    const raw = text ?? '';
+
+    const trimmed = raw.trim();
+    if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+      try {
+        const obj = JSON.parse(trimmed);
+        if (obj && typeof obj === 'object' && Array.isArray((obj as any).elements)) {
+          return trimmed;
+        }
+      } catch {
+        // 不是合法 JSON，就走 fallback 包装
+      }
+    }
+
     return JSON.stringify({
-      config: {
-        wide_screen_mode: true,
-      },
+      config: { wide_screen_mode: true },
       elements: [
         {
           tag: 'div',
-          text: {
-            tag: 'lark_md',
-            content: text,
-          },
+          text: { tag: 'lark_md', content: raw },
         },
       ],
     });
   }
 
-  // --- Public Methods ---
-
-  /**
-   * 发送消息 (卡片模式)
-   */
-  public async sendMessage(chatId: string, text: string): Promise<string | null> {
+  async sendMessage(chatId: string, text: string): Promise<string | null> {
     try {
+      const isCard = looksLikeJsonCard(text);
+
+      const finalContent = isCard ? text : this.makeCard(text);
+
       const res = await this.apiClient.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          msg_type: 'interactive',
-          content: this.makeCard(text),
+          msg_type: 'interactive', // 永远使用 interactive
+          content: finalContent,
         },
       });
-
-      if (res.code === 0 && res.data?.message_id) {
-        return res.data.message_id;
-      } else {
-        console.error('[Feishu] ❌ Send failed with API error:', res);
-        return null;
-      }
-    } catch (error) {
-      console.error('[Feishu] ❌ Failed to send message:', error);
+      if (res.code === 0 && res.data?.message_id) return res.data.message_id;
+      console.error('[Feishu] ❌ Send failed:', res);
+      return null;
+    } catch (e) {
+      console.error('[Feishu] ❌ Failed to send:', e);
       return null;
     }
   }
 
-  /**
-   * 编辑消息 (卡片模式)
-   */
-  public async editMessage(chatId: string, messageId: string, text: string): Promise<boolean> {
+  async editMessage(chatId: string, messageId: string, text: string): Promise<boolean> {
     try {
       const res = await this.apiClient.im.message.patch({
         path: { message_id: messageId },
         data: {
-          content: this.makeCard(text),
+          content: text,
         },
       });
 
-      if (res.code === 0) {
-        return true;
-      } else {
-        console.error(`[Feishu] ❌ Edit failed (${res.code}): ${res.msg}`);
-        return false;
-      }
-    } catch (error) {
+      return res.code === 0;
+    } catch {
       return false;
     }
   }
 
-  public async addReaction(messageId: string, emojiType: string): Promise<string | null> {
+  async addReaction(messageId: string, emojiType: string): Promise<string | null> {
     try {
       const res = await this.apiClient.im.messageReaction.create({
         path: { message_id: messageId },
         data: { reaction_type: { emoji_type: emojiType } },
       });
       return res.data?.reaction_id || null;
-    } catch (error) {
+    } catch {
       return null;
     }
   }
 
-  public async removeReaction(messageId: string, reactionId: string) {
+  async removeReaction(messageId: string, reactionId: string) {
     if (!reactionId) return;
     try {
       await this.apiClient.im.messageReaction.delete({
         path: { message_id: messageId, reaction_id: reactionId },
       });
-    } catch (error) {
+    } catch {
       // ignore
     }
   }
 
-  public async startWebSocket(onMessage: MessageHandler) {
+  async startWebSocket(onMessage: IncomingMessageHandler) {
     if (globalState.__feishu_ws_client_instance) return;
 
     this.wsClient = new lark.WSClient({
-      appId: this.config.appId,
-      appSecret: this.config.appSecret,
+      appId: this.config.app_id,
+      appSecret: this.config.app_secret,
       loggerLevel: lark.LoggerLevel.info,
     });
 
@@ -187,7 +196,6 @@ export class FeishuClient {
         const text = this.parseAndCleanContent(message.content, message.mentions);
         if (!text) return;
 
-        console.log(`[Feishu WS] 📩 Message from ${senderId}: "${text}"`);
         await onMessage(chatId, text, messageId, senderId);
       },
     });
@@ -197,7 +205,7 @@ export class FeishuClient {
     console.log('✅ Feishu WebSocket Connected!');
   }
 
-  public async startWebhook(onMessage: MessageHandler) {
+  async startWebhook(onMessage: IncomingMessageHandler) {
     if (this.httpServer) return;
 
     const port = this.config.port || 8080;
@@ -217,15 +225,9 @@ export class FeishuClient {
 
           let body: any = JSON.parse(rawBody);
 
-          if (body.encrypt && this.config.encryptKey) {
-            try {
-              const decrypted = decryptEvent(body.encrypt, this.config.encryptKey);
-              body = JSON.parse(decrypted);
-            } catch (e) {
-              console.error('[Feishu Webhook] ❌ Decryption Failed');
-              res.writeHead(500);
-              return res.end();
-            }
+          if (body.encrypt && this.config.encrypt_key) {
+            const decrypted = decryptEvent(body.encrypt, this.config.encrypt_key);
+            body = JSON.parse(decrypted);
           }
 
           if (body.type === 'url_verification') {
@@ -245,7 +247,6 @@ export class FeishuClient {
             if (messageId && chatId && !this.isMessageProcessed(messageId)) {
               const text = this.parseAndCleanContent(event.message.content, event.message.mentions);
               if (text) {
-                console.log(`[Feishu Webhook] 📩 Message from ${senderId}: "${text}"`);
                 onMessage(chatId, text, messageId, senderId).catch(err => {
                   console.error('[Feishu Webhook] ❌ Handler Error:', err);
                 });
@@ -256,8 +257,8 @@ export class FeishuClient {
 
           res.writeHead(200);
           res.end('OK');
-        } catch (error) {
-          console.error('[Feishu Webhook] ❌ Server Error:', error);
+        } catch (e) {
+          console.error('[Feishu Webhook] ❌ Server Error:', e);
           if (!res.headersSent) {
             res.writeHead(500);
             res.end();
@@ -271,17 +272,12 @@ export class FeishuClient {
     });
   }
 
-  public async stop() {
+  async stop() {
     if (this.wsClient) {
-      try {
-        console.log('[Feishu] Stopping WebSocket client...');
-        this.wsClient = null;
-        globalState.__feishu_ws_client_instance = null;
-      } catch (e) {}
+      this.wsClient = null;
+      globalState.__feishu_ws_client_instance = null;
     }
-
     if (this.httpServer) {
-      console.log('[Feishu] Stopping Webhook server...');
       this.httpServer.close();
       this.httpServer = null;
     }

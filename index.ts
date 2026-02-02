@@ -1,101 +1,109 @@
+// index.ts
 import type { Plugin } from '@opencode-ai/plugin';
 import type { Config } from '@opencode-ai/sdk';
-import { FeishuClient } from './src/feishu';
-import { buildOpenCodeApi } from './src/opencode';
-import { createMessageHandler, startGlobalEventListener } from './src/handler';
-import type { FeishuConfig } from './src/types';
-import { PLUGIN_CONFIG_NAME } from './src/constants';
-import { globalState } from './src/utils';
 
-if (!globalState.__feishu_plugin_listener_started) {
-  globalState.__feishu_plugin_listener_started = false;
+import { globalState } from './src/utils';
+import { AGENT_LARK, AGENT_IMESSAGE, AGENT_TELEGRAM } from './src/constants';
+
+import { buildOpenCodeApi } from './src/bridge/opencode.bridge';
+import { AdapterMux } from './src/handler/mux';
+import { startGlobalEventListener, createIncomingHandler } from './src/handler';
+
+import { FeishuAdapter } from './src/feishu/feishu.adapter';
+import type { FeishuConfig, BridgeAdapter } from './src/types';
+
+function isEnabled(cfg: Config, key: string): boolean {
+  const node = (cfg as any)?.agent?.[key];
+  if (!node) return false;
+  if (node.disable === true) return false;
+  return true;
 }
 
-let feishuInstance: FeishuClient | null = globalState.__feishu_client_instance || null;
+function parseFeishuConfig(cfg: Config): FeishuConfig {
+  const node = (cfg as any)?.agent?.[AGENT_LARK];
+  const options = (node?.options || {}) as Record<string, any>;
 
-export const FeishuBridgePlugin: Plugin = async ctx => {
+  const app_id = options.app_id;
+  const app_secret = options.app_secret;
+  const mode = (options.mode || 'ws') as 'ws' | 'webhook';
+
+  if (!app_id || !app_secret) {
+    throw new Error(`[Plugin] Missing options for ${AGENT_LARK}: app_id/app_secret`);
+  }
+
+  return {
+    app_id,
+    app_secret,
+    mode,
+    port: options.port,
+    path: options.path,
+    encrypt_key: options.encrypt_key,
+  };
+}
+
+export const BridgePlugin: Plugin = async ctx => {
   const { client } = ctx;
-  console.log('[Plugin] Plugin Initializing...');
+  console.log('[Plugin] BridgePlugin entry initializing...');
 
   const bootstrap = async () => {
     try {
-      const configPromise = client.config.get();
-      const timeoutPromise = new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Config Timeout')), 1000)
-      );
+      const raw = await client.config.get();
+      const cfg = ((raw as any)?.data || raw || {}) as Config;
 
-      let rawResponse: any = null;
-      try {
-        rawResponse = await Promise.race([configPromise, timeoutPromise]);
-      } catch (e) {
-        console.error('[Plugin] Config API Failed', e);
-        return;
-      }
-
-      const agentConfig = (rawResponse?.data || rawResponse || {}) as Config;
-      const larkConfig = (agentConfig?.agent?.[PLUGIN_CONFIG_NAME]?.options || {}) as Record<
-        string,
-        any
-      >;
-
-      const appId = larkConfig.app_id;
-      const appSecret = larkConfig.app_secret;
-      const mode = (larkConfig.mode || 'ws').toLowerCase();
-
-      if (!appId || !appSecret) {
-        console.error('[Plugin] ❌ Missing app_id or app_secret');
-        return;
-      }
-
-      const config: FeishuConfig = {
-        appId,
-        appSecret,
-        port: larkConfig.port ? parseInt(larkConfig.port, 10) : undefined,
-        path: larkConfig.path,
-        encryptKey: larkConfig.encrypt_key,
-        mode: mode as 'ws' | 'webhook',
-      };
+      // mux 单例
+      const mux: AdapterMux = globalState.__bridge_mux || new AdapterMux();
+      globalState.__bridge_mux = mux;
 
       const api = buildOpenCodeApi(client);
 
-      if (!feishuInstance) {
-        console.log('[Plugin] Creating new FeishuClient...');
-        feishuInstance = new FeishuClient(config);
-        globalState.__feishu_client_instance = feishuInstance;
-      } else {
-        console.log('[Plugin] Reusing existing FeishuClient instance.');
+      // 允许多个 adapter 同时启用
+      const adaptersToStart: Array<{ key: string; adapter: BridgeAdapter }> = [];
+
+      if (isEnabled(cfg, AGENT_LARK)) {
+        const feishuCfg = parseFeishuConfig(cfg);
+        adaptersToStart.push({ key: AGENT_LARK, adapter: new FeishuAdapter(feishuCfg) });
       }
 
-      const feishuClient = feishuInstance!;
+      if (isEnabled(cfg, AGENT_IMESSAGE)) {
+        console.log('[Plugin] imessage-bridge enabled (not implemented yet).');
+        // TODO: mux.register(AGENT_IMESSAGE, new IMessageAdapter(...))
+      }
 
-      if (!globalState.__feishu_plugin_listener_started) {
-        console.log('[Plugin] Starting Global Event Listener...');
+      if (isEnabled(cfg, AGENT_TELEGRAM)) {
+        console.log('[Plugin] telegram-bridge enabled (not implemented yet).');
+        // TODO: mux.register(AGENT_TELEGRAM, new TelegramAdapter(...))
+      }
 
-        startGlobalEventListener(api, feishuClient).catch(err => {
-          console.error('[Plugin] ❌ Failed to start Global Event Listener:', err);
-          globalState.__feishu_plugin_listener_started = false;
+      if (adaptersToStart.length === 0) {
+        console.log('[Plugin] No bridge enabled.');
+        return;
+      }
+
+      // 注册 + start（incoming）
+      for (const { key, adapter } of adaptersToStart) {
+        mux.register(key, adapter);
+        const incoming = createIncomingHandler(api, mux, key);
+        await adapter.start(incoming);
+        console.log(`[Plugin] ✅ Started adapter: ${key}`);
+      }
+
+      // 全局 listener 只启动一次（mux）
+      if (!globalState.__bridge_listener_started) {
+        globalState.__bridge_listener_started = true;
+        startGlobalEventListener(api, mux).catch(err => {
+          console.error('[Plugin] ❌ startGlobalEventListener failed:', err);
+          globalState.__bridge_listener_started = false;
         });
-
-        globalState.__feishu_plugin_listener_started = true;
       } else {
-        console.log('[Plugin] Global Event Listener already running. Skipping.');
+        console.log('[Plugin] Global listener already started.');
       }
 
-      const messageHandler = createMessageHandler(api, feishuClient);
-
-      if (config.mode === 'webhook') {
-        await feishuClient.startWebhook(messageHandler);
-      } else {
-        await feishuClient.startWebSocket(messageHandler);
-      }
-
-      console.log(`[Plugin] 🚀 Service Ready in [${mode}] mode.`);
-    } catch (error) {
-      console.error('[Plugin] Bootstrap Error:', error);
+      console.log('[Plugin] ✅ BridgePlugin ready.');
+    } catch (e) {
+      console.error('[Plugin] Bootstrap error:', e);
     }
   };
 
   bootstrap();
-
   return {};
 };
