@@ -2,22 +2,25 @@ import * as lark from '@larksuiteoapi/node-sdk';
 import * as http from 'http';
 import * as crypto from 'crypto';
 import type { FeishuConfig } from './types';
-import { globalState, processedMessageIds } from './utils';
+
+const globalState = globalThis as any;
+const processedMessageIds = globalState.__feishu_processed_ids || new Set<string>();
+globalState.__feishu_processed_ids = processedMessageIds;
 
 type MessageHandler = (
   chatId: string,
   text: string,
   messageId: string,
-  senderId: string
+  senderId: string,
 ) => Promise<void>;
 
 function decryptEvent(encrypted: string, encryptKey: string): string {
   const key = crypto.createHash('sha256').update(encryptKey).digest();
   const encryptedBuffer = Buffer.from(encrypted, 'base64');
   const iv = encryptedBuffer.subarray(0, 16);
-  const cipherText = encryptedBuffer.subarray(16);
+  const ciphertext = encryptedBuffer.subarray(16);
   const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-  let decrypted = decipher.update(cipherText, undefined, 'utf8');
+  let decrypted = decipher.update(ciphertext, undefined, 'utf8');
   decrypted += decipher.final('utf8');
   return decrypted;
 }
@@ -69,10 +72,30 @@ export class FeishuClient {
     }
   }
 
+  /**
+   * 构造 Markdown 卡片 JSON
+   */
+  private makeCard(text: string): string {
+    return JSON.stringify({
+      config: {
+        wide_screen_mode: true,
+      },
+      elements: [
+        {
+          tag: 'div',
+          text: {
+            tag: 'lark_md',
+            content: text,
+          },
+        },
+      ],
+    });
+  }
+
   // --- Public Methods ---
 
   /**
-   * 发送消息
+   * 发送消息 (卡片模式)
    */
   public async sendMessage(chatId: string, text: string): Promise<string | null> {
     try {
@@ -80,13 +103,12 @@ export class FeishuClient {
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
-          msg_type: 'text',
-          content: JSON.stringify({ text }),
+          msg_type: 'interactive',
+          content: this.makeCard(text),
         },
       });
 
       if (res.code === 0 && res.data?.message_id) {
-        console.log(`[Feishu] ✅ Message sent: ${res.data.message_id}`);
         return res.data.message_id;
       } else {
         console.error('[Feishu] ❌ Send failed with API error:', res);
@@ -99,28 +121,24 @@ export class FeishuClient {
   }
 
   /**
-   * 编辑已发送的消息
-   * ✅ 修复：移除了 msg_type，完全匹配 SDK 的 patch 类型定义
+   * 编辑消息 (卡片模式)
    */
   public async editMessage(chatId: string, messageId: string, text: string): Promise<boolean> {
     try {
       const res = await this.apiClient.im.message.patch({
         path: { message_id: messageId },
         data: {
-          // msg_type: 'text', // ❌ 删除这一行，SDK 的 patch 方法不支持 msg_type
-          content: JSON.stringify({ text }),
+          content: this.makeCard(text),
         },
       });
 
       if (res.code === 0) {
         return true;
       } else {
-        // SDK 返回的 msg 可能是 string | undefined
         console.error(`[Feishu] ❌ Edit failed (${res.code}): ${res.msg}`);
         return false;
       }
     } catch (error) {
-      console.error('[Feishu] ❌ Failed to edit message:', error);
       return false;
     }
   }
@@ -259,9 +277,7 @@ export class FeishuClient {
         console.log('[Feishu] Stopping WebSocket client...');
         this.wsClient = null;
         globalState.__feishu_ws_client_instance = null;
-      } catch (e) {
-        console.warn('[Feishu] Error stopping WS:', e);
-      }
+      } catch (e) {}
     }
 
     if (this.httpServer) {
