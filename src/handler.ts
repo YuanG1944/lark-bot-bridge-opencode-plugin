@@ -82,7 +82,7 @@ export const createMessageHandler = (api: OpenCodeApi, feishu: FeishuClient) => 
 
           while (attempts < 60) {
             attempts++;
-            await sleep(1000);
+            await sleep(60000);
 
             const res: any = await api.getMessages({
               path: { id: sessionId },
@@ -118,7 +118,10 @@ export const createMessageHandler = (api: OpenCodeApi, feishu: FeishuClient) => 
             console.log(`[Bridge] ✅ Reply sent (${replyText.length} chars)`);
             await feishu.sendMessage(chatId, replyText);
           } else {
-            await feishu.sendMessage(chatId, '❌ AI Response Timeout');
+            await feishu.sendMessage(
+              chatId,
+              '❌ AI Response Timeout. If this task still pending, you can resent a message to activate it.'
+            );
           }
         }
       } catch (error: any) {
