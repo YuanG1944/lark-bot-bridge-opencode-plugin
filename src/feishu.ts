@@ -11,16 +11,13 @@ type MessageHandler = (
   senderId: string
 ) => Promise<void>;
 
-/**
- * 🔐 解密飞书事件 (AES-256-CBC)
- */
 function decryptEvent(encrypted: string, encryptKey: string): string {
   const key = crypto.createHash('sha256').update(encryptKey).digest();
   const encryptedBuffer = Buffer.from(encrypted, 'base64');
   const iv = encryptedBuffer.subarray(0, 16);
-  const ciphertext = encryptedBuffer.subarray(16);
+  const cipherText = encryptedBuffer.subarray(16);
   const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-  let decrypted = decipher.update(ciphertext, undefined, 'utf8');
+  let decrypted = decipher.update(cipherText, undefined, 'utf8');
   decrypted += decipher.final('utf8');
   return decrypted;
 }
@@ -40,14 +37,12 @@ export class FeishuClient {
   }
 
   // --- Helpers ---
-
   private isMessageProcessed(messageId: string): boolean {
     if (processedMessageIds.has(messageId)) {
       console.log(`[Feishu] 🚫 Ignoring duplicate message ID: ${messageId}`);
       return true;
     }
     processedMessageIds.add(messageId);
-    // 限制缓存大小，防止内存泄漏
     if (processedMessageIds.size > 2000) {
       const first = processedMessageIds.values().next().value;
       processedMessageIds.delete(first);
@@ -55,15 +50,10 @@ export class FeishuClient {
     return false;
   }
 
-  /**
-   * 精确解析消息内容，剔除 @ 机器人占位符，增强错误上报
-   */
   private parseAndCleanContent(contentJson: string, mentions?: any[]): string {
     try {
       const content = JSON.parse(contentJson);
       let text: string = content.text || '';
-
-      // 1. 根据 mentions 数组精确剔除占位符 (如 at_1)，避免正则误伤邮箱
       if (mentions && mentions.length > 0) {
         mentions.forEach((m: any) => {
           if (m.key) {
@@ -72,24 +62,21 @@ export class FeishuClient {
           }
         });
       }
-
-      // 2. 清理多余空格
       return text.trim();
     } catch (e: any) {
-      // 捕获并报告详细错误
-      console.error(`[Feishu] ❌ Content Parse Error!`, {
-        error: e.message,
-        rawContent: contentJson,
-      });
+      console.error(`[Feishu] ❌ Content Parse Error!`, e);
       return '';
     }
   }
 
   // --- Public Methods ---
 
-  public async sendMessage(chatId: string, text: string) {
+  /**
+   * 发送消息
+   */
+  public async sendMessage(chatId: string, text: string): Promise<string | null> {
     try {
-      await this.apiClient.im.message.create({
+      const res = await this.apiClient.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
           receive_id: chatId,
@@ -97,9 +84,44 @@ export class FeishuClient {
           content: JSON.stringify({ text }),
         },
       });
-      console.log(`[Feishu] ✅ Message sent to ${chatId}`);
+
+      if (res.code === 0 && res.data?.message_id) {
+        console.log(`[Feishu] ✅ Message sent: ${res.data.message_id}`);
+        return res.data.message_id;
+      } else {
+        console.error('[Feishu] ❌ Send failed with API error:', res);
+        return null;
+      }
     } catch (error) {
       console.error('[Feishu] ❌ Failed to send message:', error);
+      return null;
+    }
+  }
+
+  /**
+   * 编辑已发送的消息
+   * ✅ 修复：移除了 msg_type，完全匹配 SDK 的 patch 类型定义
+   */
+  public async editMessage(chatId: string, messageId: string, text: string): Promise<boolean> {
+    try {
+      const res = await this.apiClient.im.message.patch({
+        path: { message_id: messageId },
+        data: {
+          // msg_type: 'text', // ❌ 删除这一行，SDK 的 patch 方法不支持 msg_type
+          content: JSON.stringify({ text }),
+        },
+      });
+
+      if (res.code === 0) {
+        return true;
+      } else {
+        // SDK 返回的 msg 可能是 string | undefined
+        console.error(`[Feishu] ❌ Edit failed (${res.code}): ${res.msg}`);
+        return false;
+      }
+    } catch (error) {
+      console.error('[Feishu] ❌ Failed to edit message:', error);
+      return false;
     }
   }
 
@@ -111,7 +133,6 @@ export class FeishuClient {
       });
       return res.data?.reaction_id || null;
     } catch (error) {
-      console.warn(`[Feishu] Failed to add reaction (${emojiType}):`, error);
       return null;
     }
   }
@@ -123,18 +144,12 @@ export class FeishuClient {
         path: { message_id: messageId, reaction_id: reactionId },
       });
     } catch (error) {
-      // 忽略移除失败（可能由于表情已被手动移除）
+      // ignore
     }
   }
 
-  /**
-   * 启动 WebSocket 监听 (长连接模式)
-   */
   public async startWebSocket(onMessage: MessageHandler) {
-    if (globalState.__feishu_ws_client_instance) {
-      console.log('[Feishu WS] ⚠️ Active connection detected. Skipping.');
-      return;
-    }
+    if (globalState.__feishu_ws_client_instance) return;
 
     this.wsClient = new lark.WSClient({
       appId: this.config.appId,
@@ -164,9 +179,6 @@ export class FeishuClient {
     console.log('✅ Feishu WebSocket Connected!');
   }
 
-  /**
-   * 启动 Webhook 服务 (HTTP 模式)
-   */
   public async startWebhook(onMessage: MessageHandler) {
     if (this.httpServer) return;
 
@@ -187,7 +199,6 @@ export class FeishuClient {
 
           let body: any = JSON.parse(rawBody);
 
-          // 解密逻辑
           if (body.encrypt && this.config.encryptKey) {
             try {
               const decrypted = decryptEvent(body.encrypt, this.config.encryptKey);
@@ -199,7 +210,6 @@ export class FeishuClient {
             }
           }
 
-          // URL 验证
           if (body.type === 'url_verification') {
             res.writeHead(200, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ challenge: body.challenge }));

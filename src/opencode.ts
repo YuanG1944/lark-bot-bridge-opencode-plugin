@@ -4,7 +4,7 @@ import type {
   SessionPromptData,
   SessionMessagesData,
   SessionListData,
-  OpencodeClient,
+  OpencodeClient, // 确保引入了 OpencodeClient
 } from '@opencode-ai/sdk';
 
 export interface OpenCodeApi {
@@ -20,6 +20,7 @@ export interface OpenCodeApi {
   getSessionList: (
     data: Omit<SessionListData, 'url'>
   ) => Promise<ReturnType<OpencodeClient['session']['list']>>;
+  event: OpencodeClient['event'];
 }
 
 const findMethod = (client: any, name: string, namespace?: string) => {
@@ -43,5 +44,6 @@ export const buildOpenCodeApi = (client: any): OpenCodeApi => {
     promptSession: findMethod(client, 'sessionPrompt', 'session'),
     getMessages: findMethod(client, 'sessionMessages', 'session'),
     getSessionList: findMethod(client, 'sessionList', 'session'),
+    event: client.event,
   };
 };

@@ -1,138 +1,173 @@
-import type { TextPartInput } from '@opencode-ai/sdk';
 import type { OpenCodeApi } from './opencode';
 import type { FeishuClient } from './feishu';
 import { LOADING_EMOJI } from './constants';
 
-const sessionMap = new Map<string, string>();
-export const sessionOwnerMap = new Map<string, string>();
-const chatQueues = new Map<string, Promise<void>>();
+interface SessionContext {
+  chatId: string;
+  senderId: string;
+}
 
-const MAX_CONTENT_LENGTH = 500;
+interface MessageBuffer {
+  feishuMsgId: string | null;
+  fullContent: string;
+  type: 'text' | 'reasoning';
+  lastUpdateTime: number;
+  isFinished: boolean;
+}
+
+const sessionToFeishuMap = new Map<string, SessionContext>();
+
+const messageBuffers = new Map<string, MessageBuffer>();
+
+const UPDATE_INTERVAL = 800;
+
+export async function startGlobalEventListener(api: OpenCodeApi, feishu: FeishuClient) {
+  console.log('[Listener] 🎧 Starting Global Event Subscription...');
+
+  let retryCount = 0;
+
+  const connect = async () => {
+    try {
+      // 建立 WebSocket 长连接
+      const events = await api.event.subscribe();
+      console.log('[Listener] ✅ Connected to OpenCode Event Stream');
+      retryCount = 0;
+
+      for await (const event of events.stream) {
+        if (event.type === 'message.part.updated') {
+          const sessionId = event.properties.part.sessionID;
+          const part = event.properties.part;
+
+          if (!sessionId || !part) continue;
+
+          const context = sessionToFeishuMap.get(sessionId);
+          if (!context) continue;
+
+          const msgId = part.messageID;
+
+          if (part.type === 'text' || part.type === 'reasoning') {
+            await handleStreamUpdate(feishu, context.chatId, msgId, part);
+          } else if (part.type === 'tool') {
+            if (part.state?.status === 'running') {
+              console.log(`[Listener] 🔧 Tool Running: ${part.tool}`);
+            }
+          }
+        } else if (event.type === 'session.deleted' || event.type === 'session.error') {
+          const sid = (event.properties as any).sessionID || (event.properties as any).info?.id;
+          if (sid) sessionToFeishuMap.delete(sid);
+        }
+      }
+    } catch (error) {
+      console.error('[Listener] ❌ Stream Disconnected:', error);
+
+      const delay = Math.min(5000 * (retryCount + 1), 60000);
+      retryCount++;
+      console.log(`[Listener] 🔄 Reconnecting in ${delay / 1000}s...`);
+      setTimeout(connect, delay);
+    }
+  };
+
+  connect();
+}
+
+async function handleStreamUpdate(feishu: FeishuClient, chatId: string, msgId: string, part: any) {
+  if (!msgId) return;
+
+  let buffer = messageBuffers.get(msgId);
+  if (!buffer) {
+    buffer = {
+      feishuMsgId: null,
+      fullContent: '',
+      type: part.type,
+      lastUpdateTime: 0,
+      isFinished: false,
+    };
+    messageBuffers.set(msgId, buffer);
+  }
+
+  if (typeof part.text === 'string') {
+    buffer.fullContent = part.text;
+  }
+
+  const now = Date.now();
+  const shouldUpdate = !buffer.feishuMsgId || now - buffer.lastUpdateTime > UPDATE_INTERVAL;
+
+  if (shouldUpdate && buffer.fullContent) {
+    buffer.lastUpdateTime = now;
+
+    let displayContent = buffer.fullContent;
+
+    if (buffer.type === 'reasoning') {
+      displayContent = `🤔 思考中...\n\n${displayContent}`;
+    }
+
+    try {
+      if (!buffer.feishuMsgId) {
+        const sentId = await feishu.sendMessage(chatId, displayContent);
+        if (sentId) buffer.feishuMsgId = sentId;
+      } else {
+        // 后续：编辑消息
+        await feishu.editMessage(chatId, buffer.feishuMsgId, displayContent);
+      }
+    } catch (e) {
+      console.error(`[Listener] Failed to update Feishu msg:`, e);
+    }
+  }
+}
+
+const sessionCache = new Map<string, string>();
 
 export const createMessageHandler = (api: OpenCodeApi, feishu: FeishuClient) => {
   return async (chatId: string, text: string, messageId: string, senderId: string) => {
     console.log(`[Bridge] 📥 Incoming: "${text}"`);
 
+    // 1. 心跳检测
     if (text.trim().toLowerCase() === 'ping') {
       await feishu.sendMessage(chatId, 'Pong! ⚡️');
       return;
     }
 
-    const previousTask = chatQueues.get(chatId) || Promise.resolve();
+    let reactionId: string | null = null;
 
-    const currentTask = (async () => {
-      await previousTask.catch(() => {});
+    try {
+      if (messageId) {
+        reactionId = await feishu.addReaction(messageId, LOADING_EMOJI);
+      }
 
-      let reactionId: string | null = null;
-      try {
-        if (messageId) {
-          reactionId = await feishu.addReaction(messageId, LOADING_EMOJI);
-        }
+      let sessionId = sessionCache.get(chatId);
+      if (!sessionId) {
+        const uniqueTitle = `Chat ${chatId.slice(-4)} [${new Date().toLocaleTimeString()}]`;
+        const res = await api.createSession({ body: { title: uniqueTitle } });
+        sessionId = res.data?.id;
 
-        let sessionId = sessionMap.get(chatId);
-        if (!sessionId) {
-          const res = await api.createSession({ body: { title: `Chat ${chatId.slice(-4)}` } });
-          sessionId = res.data?.id;
-          if (sessionId) {
-            sessionMap.set(chatId, sessionId);
-            sessionOwnerMap.set(sessionId, senderId);
-          }
-        }
-
-        if (!sessionId) throw new Error('Session Init Failed');
-
-        console.log(`[Bridge] 🚀 Task Started: ${sessionId}`);
-
-        const res = await api.promptSession({
-          path: { id: sessionId },
-          body: { parts: [{ type: 'text', text: text }] },
-        });
-
-        const assistantParts = res.data?.parts || [];
-        let finalResponse = '';
-
-        assistantParts.forEach((part: any, index: number) => {
-          const partType = part.type;
-
-          const stagePrefix = '⚙️ [LLM Intermediate Stage - Not Final Result]\n';
-
-          switch (partType) {
-            case 'reasoning':
-              console.log(`[Bridge] 🧠 Stage: Reasoning`);
-              const thought =
-                part.text.length > MAX_CONTENT_LENGTH
-                  ? `${part.text.substring(
-                      0,
-                      MAX_CONTENT_LENGTH
-                    )}... (Detailed reasoning hidden due to size)`
-                  : part.text;
-              finalResponse += `${stagePrefix}> 💭 AI Thinking: ${thought}\n\n`;
-              break;
-
-            case 'text':
-              finalResponse += `${part.text}\n`;
-              break;
-
-            case 'tool':
-              console.log(`[Bridge] 🔧 Stage: Tooling (${part.tool})`);
-              finalResponse += `${stagePrefix}🔧 Calling Tool: \`${part.tool}\` (State: ${part.state})\n\n`;
-              break;
-
-            case 'step-start':
-              console.log(`[Bridge] 🏁 Stage: Step Start`);
-              finalResponse += `${stagePrefix}🚀 Starting execution step...\n\n`;
-              break;
-
-            case 'step-finish':
-              console.log(`[Bridge] ✅ Stage: Step Finish`);
-              finalResponse += `${stagePrefix}✅ Step completed. (Reason: ${part.reason})\n\n`;
-              break;
-
-            case 'patch':
-              console.log(`[Bridge] 📝 Stage: Patching`);
-              finalResponse += `${stagePrefix}📝 Modifying files: \`${part.files?.join(
-                ', '
-              )}\` (Full diff in background)\n\n`;
-              break;
-
-            case 'file':
-              console.log(`[Bridge] 📄 Stage: File Export`);
-              finalResponse += `📄 Generated File: [${part.filename || 'Download'}](${
-                part.url
-              })\n\n`;
-              break;
-
-            case 'subtask':
-              console.log(`[Bridge] 📋 Stage: Subtask`);
-              finalResponse += `${stagePrefix}📋 Assigning subtask: ${part.description}\n\n`;
-              break;
-
-            case 'snapshot':
-              console.log(`[Bridge] 📸 Stage: Snapshot`);
-              finalResponse += `${stagePrefix}📸 Environment snapshot taken.\n\n`;
-              break;
-
-            default:
-              console.log(`[Bridge] ℹ️ Stage: ${partType}`);
-          }
-        });
-
-        if (finalResponse.trim()) {
-          // 在末尾增加一个小的分隔，提示回复结束
-          await feishu.sendMessage(chatId, finalResponse.trim());
-        }
-      } catch (err: any) {
-        console.error(`[Bridge] ❌ Error:`, err);
-        if (err.status === 404) sessionMap.delete(chatId);
-        await feishu.sendMessage(chatId, `❌ Error: ${err.message || 'Unknown error'}`);
-      } finally {
-        if (messageId && reactionId) {
-          await feishu.removeReaction(messageId, reactionId).catch(() => {});
+        if (sessionId) {
+          sessionCache.set(chatId, sessionId);
+          console.log(`[Bridge] ✨ Created Session: ${sessionId}`);
         }
       }
-    })();
 
-    chatQueues.set(chatId, currentTask);
-    return currentTask;
+      if (!sessionId) throw new Error('Failed to init Session');
+
+      sessionToFeishuMap.set(sessionId, { chatId, senderId });
+
+      await api.promptSession({
+        path: { id: sessionId },
+        body: { parts: [{ type: 'text', text: text }] },
+      });
+
+      console.log(`[Bridge] 🚀 Prompt Sent to ${sessionId}. Listener will handle the rest.`);
+    } catch (error: any) {
+      console.error('[Bridge] ❌ Error:', error);
+
+      if (error.status === 404) {
+        sessionCache.delete(chatId);
+      }
+
+      await feishu.sendMessage(chatId, `❌ Error: ${error.message || 'Request failed'}`);
+    } finally {
+      if (messageId && reactionId) {
+        await feishu.removeReaction(messageId, reactionId).catch(() => {});
+      }
+    }
   };
 };
