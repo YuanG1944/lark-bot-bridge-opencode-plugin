@@ -10,22 +10,19 @@ interface SessionContext {
 }
 
 interface MessageBuffer {
-  feishuMsgId: string | null; // 飞书侧的消息 ID
-  fullContent: string; // 本地累积的完整内容
-  type: 'text' | 'reasoning';
-  lastUpdateTime: number; // 上次调用飞书 API 的时间
-  isFinished: boolean;
+  feishuMsgId: string | null;
+  // 🔥 改动 1: 分离思考过程和正文，分别存储
+  reasoningContent: string;
+  textContent: string;
+  lastUpdateTime: number;
 }
 
 // --- 全局状态 ---
-// 1. 路由表
 const sessionToFeishuMap = new Map<string, SessionContext>();
-// 2. 消息缓冲区
 const messageBuffers = new Map<string, MessageBuffer>();
+const messageRoleMap = new Map<string, string>(); // 角色缓存
 
-// 3. 节流间隔 (毫秒)
-const UPDATE_INTERVAL = 800;
-// 4. 监听器锁
+const UPDATE_INTERVAL = 800; // 节流间隔
 let isListenerStarted = false;
 let shouldStopListener = false;
 
@@ -51,34 +48,48 @@ export async function startGlobalEventListener(api: OpenCodeApi, feishu: FeishuC
           break;
         }
 
+        // 1. 监听消息元数据，记录角色
+        if (event.type === 'message.updated') {
+          const info = event.properties.info;
+          if (info && info.id && info.role) {
+            messageRoleMap.set(info.id, info.role);
+          }
+          continue;
+        }
+
+        // 2. 监听内容流
         if (event.type === 'message.part.updated') {
-          // 获取核心数据
           const sessionId = event.properties.part.sessionID;
           const part = event.properties.part;
-
-          // 🔥 关键修复 1: 获取增量数据 delta 🔥
-          // SDK 的 event.properties 里通常包含 delta 字段
           const delta = (event.properties as any).delta;
 
           if (!sessionId || !part) continue;
 
+          // 过滤掉用户自己的消息
+          const msgId = part.messageID;
+          const role = messageRoleMap.get(msgId);
+          if (role === 'user') continue;
+
+          // 路由检查
           const context = sessionToFeishuMap.get(sessionId);
           if (!context) continue;
 
-          const msgId = part.messageID;
+          // 🔥 改动 2: 日志中打出 SessionID，方便追踪
+          // (为了不刷屏，这里只在有工具调用时打 Log，或者你可以选择性开启)
 
           if (part.type === 'text' || part.type === 'reasoning') {
-            // 将 delta 传给处理函数
-            await handleStreamUpdate(feishu, context.chatId, msgId, part, delta);
+            await handleStreamUpdate(feishu, context.chatId, msgId, part, delta, sessionId);
           } else if (part.type === 'tool') {
             if (part.state?.status === 'running') {
-              // 可选：打印日志或通知
-              console.log(`[Listener] 🔧 Tool Running: ${part.tool}`);
+              console.log(`[Listener] [Session: ${sessionId}] 🔧 Tool Running: ${part.tool}`);
             }
           }
         } else if (event.type === 'session.deleted' || event.type === 'session.error') {
           const sid = (event.properties as any).sessionID;
-          if (sid) sessionToFeishuMap.delete(sid);
+          if (sid) {
+            console.log(`[Listener] [Session: ${sid}] Session ended/error.`);
+            sessionToFeishuMap.delete(sid);
+          }
         }
       }
     } catch (error) {
@@ -98,6 +109,7 @@ export function stopGlobalEventListener() {
   isListenerStarted = false;
   sessionToFeishuMap.clear();
   messageBuffers.clear();
+  messageRoleMap.clear();
 }
 
 // 辅助函数：处理流式更新
@@ -106,53 +118,79 @@ async function handleStreamUpdate(
   chatId: string,
   msgId: string,
   part: Part,
-  delta?: string // 🔥 新增参数
+  delta?: string,
+  sessionId?: string // 用于日志
 ) {
   if (!msgId) return;
+  // 类型守卫
   if (part.type !== 'text' && part.type !== 'reasoning') return;
 
-  // 获取或初始化 Buffer
+  // 初始化 Buffer
   let buffer = messageBuffers.get(msgId);
   if (!buffer) {
     buffer = {
       feishuMsgId: null,
-      fullContent: '',
-      type: part.type,
+      reasoningContent: '', // 独立存储思考
+      textContent: '', // 独立存储正文
       lastUpdateTime: 0,
-      isFinished: false,
     };
     messageBuffers.set(msgId, buffer);
   }
 
-  // 🔥 关键修复 2: 优先使用 Delta 追加，否则使用全量覆盖 🔥
-  if (typeof delta === 'string' && delta.length > 0) {
-    // 情况 A: 有增量，追加
-    buffer.fullContent += delta;
+  // 🔥 改动 3: 分别追加内容 🔥
+  // 无论是增量(delta)还是全量(text)，都归类存入对应的字段
+  const contentToAdd = typeof delta === 'string' && delta.length > 0 ? delta : part.text || '';
+
+  // 注意：如果 delta 存在，我们追加；如果不存在且 part.text 存在，这通常是 snapshot
+  // 这里简化逻辑：如果是 delta 模式，追加；如果是 snapshot 模式(delta为空)，则覆盖(或追加，视SDK行为而定)
+  // 为了稳妥，我们假设 delta 优先。
+
+  if (typeof delta === 'string') {
+    if (part.type === 'reasoning') {
+      buffer.reasoningContent += delta;
+    } else {
+      buffer.textContent += delta;
+    }
   } else if (typeof part.text === 'string') {
-    // 情况 B: 无增量，可能是第一帧或者全量包
-    // 只有当 part.text 比当前 buffer 长的时候才覆盖，防止旧数据覆盖新数据
-    if (part.text.length >= buffer.fullContent.length) {
-      buffer.fullContent = part.text;
+    // 兜底：如果没有 delta，尝试用全量覆盖（防重复需小心，这里假设主要是 delta 流）
+    if (part.type === 'reasoning') {
+      if (part.text.length > buffer.reasoningContent.length) buffer.reasoningContent = part.text;
+    } else {
+      if (part.text.length > buffer.textContent.length) buffer.textContent = part.text;
     }
   }
 
-  // 节流与更新逻辑
+  // 节流
   const now = Date.now();
   const shouldUpdate = !buffer.feishuMsgId || now - buffer.lastUpdateTime > UPDATE_INTERVAL;
 
-  if (shouldUpdate && buffer.fullContent) {
+  if (shouldUpdate) {
     buffer.lastUpdateTime = now;
 
-    let displayContent = buffer.fullContent;
-    if (buffer.type === 'reasoning') {
-      displayContent = `🤔 思考中...\n\n${displayContent}`;
+    // 🔥 改动 4: 拼接显示内容 (Markdown 格式) 🔥
+    let displayContent = '';
+
+    // 如果有思考过程，用引用块包裹
+    if (buffer.reasoningContent.trim()) {
+      displayContent += `> 🧠 **思考过程**\n> ${buffer.reasoningContent.replace(
+        /\n/g,
+        '\n> '
+      )}\n\n`;
     }
+
+    // 拼接正文
+    displayContent += buffer.textContent;
+
+    // 如果两个都为空，不发送
+    if (!displayContent.trim()) return;
 
     try {
       if (!buffer.feishuMsgId) {
+        console.log(`[Listener] [Session: ${sessionId}] Sending new msg...`);
         const sentId = await feishu.sendMessage(chatId, displayContent);
         if (sentId) buffer.feishuMsgId = sentId;
       } else {
+        // console.log(`[Listener] [Session: ${sessionId}] Updating msg...`);
         await feishu.editMessage(chatId, buffer.feishuMsgId, displayContent);
       }
     } catch (e) {
@@ -166,7 +204,7 @@ const sessionCache = new Map<string, string>();
 
 export const createMessageHandler = (api: OpenCodeApi, feishu: FeishuClient) => {
   return async (chatId: string, text: string, messageId: string, senderId: string) => {
-    console.log(`[Bridge] 📥 Incoming: "${text}"`);
+    console.log(`[Bridge] 📥 Incoming: "${text}" from Chat: ${chatId}`);
 
     if (text.trim().toLowerCase() === 'ping') {
       await feishu.sendMessage(chatId, 'Pong! ⚡️');
@@ -185,9 +223,10 @@ export const createMessageHandler = (api: OpenCodeApi, feishu: FeishuClient) => 
         const uniqueTitle = `Chat ${chatId.slice(-4)} [${new Date().toLocaleTimeString()}]`;
         const res = await api.createSession({ body: { title: uniqueTitle } });
         sessionId = res.data?.id;
-
         if (sessionId) {
           sessionCache.set(chatId, sessionId);
+          // 🔥 改动 5: 创建 Session 时打印日志
+          console.log(`[Bridge] ✨ Created New Session: ${sessionId}`);
         }
       }
 
@@ -196,13 +235,13 @@ export const createMessageHandler = (api: OpenCodeApi, feishu: FeishuClient) => 
       // 注册路由
       sessionToFeishuMap.set(sessionId, { chatId, senderId });
 
-      // 发送请求
       await api.promptSession({
         path: { id: sessionId },
         body: { parts: [{ type: 'text', text: text }] },
       });
 
-      console.log(`[Bridge] 🚀 Prompt Sent.`);
+      // 🔥 改动 6: 发送 Prompt 后打印 SessionID
+      console.log(`[Bridge] [Session: ${sessionId}] 🚀 Prompt Sent.`);
     } catch (error: any) {
       console.error('[Bridge] ❌ Error:', error);
       if (error.status === 404) sessionCache.delete(chatId);
