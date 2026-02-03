@@ -62,6 +62,48 @@ After validation and real-world usage, it has evolved into a **general-purpose m
 
 ---
 
+## ✅ Slash Command Support
+
+This plugin **passes through any message starting with `/`** to OpenCode as a `session.command`.
+That means **all built-in slash commands** and **any custom commands** you define are supported. citeturn1view0turn0search1
+
+### Built-in Slash Commands (TUI)
+
+From the official TUI docs, the built-in commands include: citeturn1view0
+
+* `/connect`
+* `/compact` (alias: `/summarize`)
+* `/details`
+* `/editor`
+* `/exit` (aliases: `/quit`, `/q`)
+* `/export`
+* `/help`
+* `/init`
+* `/models`
+* `/new` (alias: `/clear`)
+* `/redo`
+* `/sessions` (aliases: `/resume`, `/continue`)
+* `/share`
+* `/theme`
+* `/thinking`
+* `/undo`
+* `/unshare`
+
+### Custom Commands
+
+Custom commands are supported via:
+
+* `opencode.json` under `command`, or
+* `.opencode/commands/*.md` files. citeturn0search1
+
+### Session / Agent Switching
+
+Session switching via `/sessions` is fully supported. The list and follow-up choices are returned to the chat, and you can reply with `/sessions <id>` to bind this chat to the chosen session. citeturn1view0
+
+If your OpenCode setup provides slash commands for agent switching, they will also work here, since **all `/` commands are forwarded without interception**. citeturn1view0turn0search1
+
+---
+
 ## 📦 Installation
 
 Inside your OpenCode Agent config directory:

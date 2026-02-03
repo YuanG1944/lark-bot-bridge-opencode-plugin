@@ -2,6 +2,7 @@
 import type {
   SessionCreateData,
   SessionPromptData,
+  SessionCommandData,
   SessionMessagesData,
   SessionListData,
   OpencodeClient,
@@ -10,6 +11,7 @@ import type {
 export interface OpenCodeApi {
   createSession: (data: Omit<SessionCreateData, 'url'>) => Promise<any>;
   promptSession: (data: Omit<SessionPromptData, 'url'>) => Promise<any>;
+  commandSession: (data: Omit<SessionCommandData, 'url'>) => Promise<any>;
   getMessages: (data: Omit<SessionMessagesData, 'url'>) => Promise<any>;
   getSessionList: (data: Omit<SessionListData, 'url'>) => Promise<any>;
   event: OpencodeClient['event'];
@@ -36,6 +38,12 @@ export const buildOpenCodeApi = (client: any): OpenCodeApi => {
     'promptSession',
   );
 
+  const commandSession = mustFindMethod(
+    client,
+    [() => client.session?.command?.bind(client.session), () => client.sessionCommand?.bind(client)],
+    'commandSession',
+  );
+
   const getMessages = mustFindMethod(
     client,
     [
@@ -58,6 +66,7 @@ export const buildOpenCodeApi = (client: any): OpenCodeApi => {
   return {
     createSession,
     promptSession,
+    commandSession,
     getMessages,
     getSessionList,
     event: client.event,

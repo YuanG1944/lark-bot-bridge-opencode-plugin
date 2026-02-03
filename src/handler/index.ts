@@ -14,7 +14,7 @@ import {
   shouldFlushNow,
 } from '../bridge/buffer';
 
-import { sleep } from '../utils';
+import { parseSlashCommand, sleep } from '../utils';
 
 type SessionContext = { chatId: string; senderId: string };
 
@@ -24,6 +24,7 @@ const msgRole = new Map<string, string>(); // messageId -> role
 const msgBuffers = new Map<string, any>(); // messageId -> buffer (MessageBuffer)
 const sessionCache = new Map<string, string>(); // adapterKey:chatId -> sessionId
 const sessionToAdapterKey = new Map<string, string>(); // sessionId -> adapterKey
+const chatAgent = new Map<string, string>(); // adapterKey:chatId -> agent
 
 let isListenerStarted = false;
 let shouldStopListener = false;
@@ -291,6 +292,7 @@ export function stopGlobalEventListener() {
   msgBuffers.clear();
   sessionCache.clear();
   sessionToAdapterKey.clear();
+  chatAgent.clear();
 }
 
 /**
@@ -303,7 +305,25 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
   return async (chatId: string, text: string, messageId: string, senderId: string) => {
     console.log(`[Bridge] 📥 [${adapterKey}] Incoming: "${text}" chat=${chatId}`);
 
-    if (text.trim().toLowerCase() === 'ping') {
+    const slash = parseSlashCommand(text);
+    const cacheKey = `${adapterKey}:${chatId}`;
+    const normalizedCommand =
+      slash?.command === 'resume' || slash?.command === 'continue'
+        ? 'sessions'
+        : slash?.command === 'clear'
+          ? 'new'
+          : slash?.command;
+    const targetSessionId =
+      normalizedCommand === 'sessions' && slash?.arguments
+        ? slash.arguments.trim().split(/\s+/)[0]
+        : null;
+    const targetAgent =
+      normalizedCommand === 'agent' && slash?.arguments
+        ? slash.arguments.trim().split(/\s+/)[0]
+        : null;
+    const shouldCreateNew = normalizedCommand === 'new';
+
+    if (!slash && text.trim().toLowerCase() === 'ping') {
       await adapter.sendMessage(chatId, 'Pong! ⚡️');
       return;
     }
@@ -315,16 +335,28 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
         reactionId = await adapter.addReaction(messageId, LOADING_EMOJI);
       }
 
-      const cacheKey = `${adapterKey}:${chatId}`;
-
       let sessionId = sessionCache.get(cacheKey);
-      if (!sessionId) {
+      if (!sessionId || shouldCreateNew) {
         const uniqueTitle = `[${adapterKey}] Chat ${chatId.slice(
           -4
         )} [${new Date().toLocaleTimeString()}]`;
         const res = await api.createSession({ body: { title: uniqueTitle } });
         sessionId = (res as any)?.data?.id;
-        if (sessionId) sessionCache.set(cacheKey, sessionId);
+        if (sessionId) {
+          sessionCache.set(cacheKey, sessionId);
+          sessionToAdapterKey.set(sessionId, adapterKey);
+          sessionToCtx.set(sessionId, { chatId, senderId });
+          chatAgent.delete(cacheKey);
+        }
+        if (shouldCreateNew) {
+          console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🆕 New Session Bound.`);
+          if (sessionId) {
+            await adapter.sendMessage(chatId, `✅ 已切换到新会话: ${sessionId}`);
+          } else {
+            await adapter.sendMessage(chatId, '❌ 新会话创建失败，请稍后重试。');
+          }
+          return;
+        }
       }
 
       if (!sessionId) throw new Error('Failed to init Session');
@@ -333,12 +365,34 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
       sessionToAdapterKey.set(sessionId, adapterKey);
       sessionToCtx.set(sessionId, { chatId, senderId });
 
-      await api.promptSession({
-        path: { id: sessionId },
-        body: { parts: [{ type: 'text', text }] },
-      });
+      if (slash) {
+        await api.commandSession({
+          path: { id: sessionId },
+          body: { command: slash.command, arguments: slash.arguments },
+        });
 
-      console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🚀 Prompt Sent.`);
+        if (targetSessionId) {
+          sessionCache.set(cacheKey, targetSessionId);
+          sessionToAdapterKey.set(targetSessionId, adapterKey);
+          sessionToCtx.set(targetSessionId, { chatId, senderId });
+          chatAgent.delete(cacheKey);
+          await adapter.sendMessage(chatId, `✅ 已切换到会话: ${targetSessionId}`);
+        }
+
+        if (targetAgent) {
+          chatAgent.set(cacheKey, targetAgent);
+          await adapter.sendMessage(chatId, `✅ 已切换 Agent: ${targetAgent}`);
+        }
+      } else {
+        const agent = chatAgent.get(cacheKey);
+        await api.promptSession({
+          path: { id: sessionId },
+          body: { parts: [{ type: 'text', text }], ...(agent ? { agent } : {}) },
+        });
+      }
+
+      const mode = slash ? `Command /${slash.command}` : 'Prompt';
+      console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🚀 ${mode} Sent.`);
     } catch (err: any) {
       console.error(`[Bridge] ❌ [${adapterKey}] Error:`, err);
       await adapter.sendMessage(chatId, `❌ Error: ${err?.message || String(err)}`);
