@@ -40,11 +40,16 @@ function isApiError(err: any): boolean {
 
 async function syncSessionToTui(api: OpencodeClient, sessionId: string) {
   const selectSession = (api as any)?.tui?.selectSession;
-  if (typeof selectSession !== 'function') return;
+  if (typeof selectSession !== 'function') {
+    console.log('[Bridge] TUI selectSession not supported (v1).');
+    return;
+  }
   try {
     await selectSession({ body: { sessionID: sessionId } });
+    console.log(`[Bridge] TUI synced to session: ${sessionId}`);
   } catch {
     // ignore if unsupported
+    console.log('[Bridge] TUI selectSession failed (unsupported or error).');
   }
 }
 
@@ -269,6 +274,16 @@ export async function startGlobalEventListener(api: OpencodeClient, mux: Adapter
           }
           continue;
         }
+
+        // 5) command.executed：标记本条消息为 command 输出
+        if (event.type === 'command.executed') {
+          const mid = event.properties?.messageID;
+          if (mid) {
+            const buf = getOrInitBuffer(msgBuffers, mid);
+            buf.isCommand = true;
+          }
+          continue;
+        }
       }
 
       await flushAll(mux);
@@ -389,25 +404,24 @@ export const createIncomingHandler = (api: OpencodeClient, mux: AdapterMux, adap
           const list = Array.isArray(data) ? data : [];
 
           const lines: string[] = [];
-          lines.push('🧰 可用命令（聊天桥适配）');
+          lines.push('🧰 Command Help');
           lines.push('────────────────────────');
-          lines.push('/help  - 查看命令与用法');
-          lines.push('/models  - 查看可用模型');
-          lines.push('/new  - 新建会话并切换');
-          lines.push('/sessions  - 列出会话（用 /sessions <id> 切换）');
-          lines.push('/share  - 分享当前会话');
-          lines.push('/unshare  - 取消分享');
-          lines.push('/compact  - 压缩/总结当前会话');
-          lines.push('/init  - 初始化项目（生成 AGENTS.md）');
-          lines.push('/agent <name>  - 切换 Agent');
+          lines.push('/help - 查看命令与用法');
+          lines.push('/models - 查看可用模型');
+          lines.push('/new - 新建会话并切换');
+          lines.push('/sessions - 列出会话（用 /sessions <id> 切换）');
+          lines.push('/share - 分享当前会话');
+          lines.push('/unshare - 取消分享');
+          lines.push('/compact - 压缩/总结当前会话');
+          lines.push('/init - 初始化项目（生成 AGENTS.md）');
+          lines.push('/agent <name> - 切换 Agent');
 
           if (list.length > 0) {
             lines.push('────────────────────────');
-            lines.push('🧩 自定义命令');
+            lines.push('🧩 Custom Commands');
             list.forEach((cmd: any) => {
               const desc = cmd?.description ? `- ${cmd.description}` : '';
-              const tmpl = cmd?.template ? ` | ${String(cmd.template).trim()}` : '';
-              lines.push(`/${cmd?.name} ${desc}${tmpl}`);
+              lines.push(`/${cmd?.name} ${desc}`);
             });
           }
           await adapter.sendMessage(chatId, lines.join('\n'));
@@ -426,17 +440,24 @@ export const createIncomingHandler = (api: OpencodeClient, mux: AdapterMux, adap
           }
 
           const lines: string[] = [];
-          lines.push('🧠 可用模型（配置生效）');
+          lines.push('🧠 Available Models');
           lines.push('────────────────────────');
+
+          const defaultLines: string[] = [];
+          Object.keys(defaults || {}).forEach(key => {
+            defaultLines.push(`${key} -> ${defaults[key]}`);
+          });
+          if (defaultLines.length > 0) {
+            lines.push('Default:');
+            defaultLines.forEach(l => lines.push(l));
+            lines.push('────────────────────────');
+          }
+
           providers.forEach((p: any) => {
             const id = p?.id || p?.name || 'unknown';
             const models = p?.models ? Object.keys(p.models) : [];
-            const defaultModel = defaults?.[id];
-            lines.push(`• ${p?.name || id} (${id})`);
-            if (defaultModel) {
-              lines.push(`  Default: ${defaultModel}`);
-            }
-            lines.push(`  Models: ${models.join(', ') || '-'}`);
+            lines.push(`${p?.name || id} (${id})`);
+            lines.push(`Models: ${models.join(', ') || '-'}`);
             lines.push('────────────────────────');
           });
 

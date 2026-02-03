@@ -34,6 +34,7 @@ export interface MessageBuffer {
   lastDisplayHash: string;
   status: BufferStatus;
   statusNote?: string;
+  isCommand?: boolean;
 }
 
 export function simpleHash(s: string): string {
@@ -72,6 +73,7 @@ export function getOrInitBuffer(
       lastDisplayHash: '',
       status: 'streaming',
       statusNote: '',
+      isCommand: false,
     };
     store.set(messageId, buf);
   }
@@ -92,7 +94,7 @@ export function markStatus(
 export function buildDisplayContent(buffer: MessageBuffer): string {
   const out: string[] = [];
 
-  out.push('## Answer');
+  out.push(buffer.isCommand ? '## Command 🧭' : '## Answer');
   out.push(buffer.text ? clipTail(buffer.text, SAFE_MAX_TEXT) : '');
   out.push('');
 
