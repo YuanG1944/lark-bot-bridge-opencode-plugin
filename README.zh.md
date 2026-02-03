@@ -55,12 +55,12 @@
 
 ## ✅ Slash 命令支持
 
-本插件会将 **所有以 `/` 开头的消息** 透传给 OpenCode 的 `session.command`。
-因此 **官方内置命令** 和 **你自定义的命令** 都可直接使用。citeturn1view0turn0search1
+本插件**优先用 OpenCode API 实现关键命令**，其余自定义命令再走 `session.command`。
+UI 相关命令（主题/编辑器/退出等）**不适合聊天场景**，因此不支持。
 
 ### 官方内置命令（TUI）
 
-根据官方 TUI 文档，内置命令包括：citeturn1view0
+根据官方 TUI 文档，内置命令包括：
 
 * `/connect`
 * `/compact`（别名：`/summarize`）
@@ -80,18 +80,41 @@
 * `/undo`
 * `/unshare`
 
+### 已适配的命令
+
+以下命令在桥接层通过 API 直接实现：
+
+* `/help` → 列出自定义命令
+* `/models` → 列出 provider 与模型
+* `/new` → 创建并绑定新会话
+* `/sessions` → 列出会话（回复 `/sessions <id>` 切换）
+* `/share` / `/unshare`
+* `/compact`（别名 `/summarize`）
+* `/init`
+* `/agent <name>` → 绑定后续对话的 Agent
+
+### UI 命令（聊天不支持）
+
+* `/connect`
+* `/details`
+* `/editor`
+* `/export`
+* `/exit`（`/quit`、`/q`）
+* `/theme`
+* `/thinking`
+
 ### 自定义命令
 
 支持以下方式定义自定义命令：
 
 * `opencode.json` 中的 `command` 字段，或
-* `.opencode/commands/*.md` 文件。citeturn0search1
+* `.opencode/commands/*.md` 文件。
 
 ### 会话 / Agent 切换
 
-`/sessions` 会返回会话列表与可选项，结果会直接回到聊天窗口，你只需回复 `/sessions <id>` 即可切换并绑定到目标会话。citeturn1view0
+`/sessions` 会返回会话列表与可选项，结果会直接回到聊天窗口，你只需回复 `/sessions <id>` 即可切换并绑定到目标会话。
 
-如果你的 OpenCode 环境提供了 Agent 切换的 slash 命令，也同样可以使用，因为 **所有 `/` 命令都会原样透传**。citeturn1view0turn0search1
+如果你的 OpenCode 环境提供了其它 slash 命令，且未在上面专门适配，则仍会走 `session.command` 透传。
 
 ---
 

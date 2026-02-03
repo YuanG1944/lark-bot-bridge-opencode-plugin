@@ -1,18 +1,19 @@
 // index.feishu.ts
 import type { Config } from '@opencode-ai/sdk';
 
-import { buildOpenCodeApi } from './src/bridge/opencode.bridge';
 import { createIncomingHandler, startGlobalEventListener } from './src/handler';
+import { AdapterMux } from './src/handler/mux';
 import { FeishuAdapter } from './src/feishu/feishu.adapter';
 
 import type { BridgeAdapter, FeishuConfig } from './src/types';
 import { globalState } from './src/utils';
 import { AGENT_LARK } from './src/constants';
+import { OpencodeClient } from '@opencode-ai/sdk';
 
 let feishuAdapter: BridgeAdapter | null = globalState.__bridge_feishu_adapter || null;
 
 function getAgentOptions(agentConfig: Config): Record<string, any> {
-  const node = agentConfig?.agent?.[AGENT_LARK] as any;
+  const node = agentConfig?.agent?.[AGENT_LARK];
   return (node?.options || {}) as Record<string, any>;
 }
 
@@ -38,7 +39,7 @@ function parseFeishuConfig(options: Record<string, any>): FeishuConfig {
 /**
  * 启动 Feishu Bridge（给总入口 index.ts 调用）
  */
-export async function startFeishuBridge(opencodeClient: any, rawConfig: Config) {
+export async function startFeishuBridge(client: OpencodeClient, rawConfig: Config) {
   // 只读 lark-bridge 配置
   const options = getAgentOptions(rawConfig);
   const feishuConfig = parseFeishuConfig(options);
@@ -56,11 +57,13 @@ export async function startFeishuBridge(opencodeClient: any, rawConfig: Config) 
     globalState.__bridge_listener_started = false;
   }
 
-  const api = buildOpenCodeApi(opencodeClient);
-
   if (!globalState.__bridge_listener_started) {
     console.log('[FeishuBridge] Starting Global Event Listener...');
-    startGlobalEventListener(api, feishuAdapter).catch(err => {
+    const mux = new AdapterMux();
+    mux.register(AGENT_LARK, feishuAdapter);
+    globalState.__bridge_mux = mux;
+
+    startGlobalEventListener(client, mux).catch(err => {
       console.error('[FeishuBridge] ❌ startGlobalEventListener failed:', err);
       globalState.__bridge_listener_started = false;
     });
@@ -70,7 +73,9 @@ export async function startFeishuBridge(opencodeClient: any, rawConfig: Config) 
   }
 
   // incoming handler（平台->opencode）
-  const incoming = createIncomingHandler(api, feishuAdapter);
+  const mux = globalState.__bridge_mux as AdapterMux;
+  if (!mux) throw new Error('[FeishuBridge] AdapterMux not initialized');
+  const incoming = createIncomingHandler(client, mux, AGENT_LARK);
   await feishuAdapter.start(incoming);
 
   console.log('[FeishuBridge] ✅ Ready.');

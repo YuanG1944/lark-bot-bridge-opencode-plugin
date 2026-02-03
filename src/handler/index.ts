@@ -1,6 +1,5 @@
 // src/handler/index.ts
-import type { Part } from '@opencode-ai/sdk';
-import type { OpenCodeApi } from '../bridge/opencode.bridge';
+import type { OpencodeClient } from '@opencode-ai/sdk';
 import type { BridgeAdapter } from '../types';
 import { LOADING_EMOJI } from '../constants';
 import { AdapterMux } from './mux';
@@ -83,7 +82,7 @@ async function flushAll(mux: AdapterMux) {
   }
 }
 
-export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux) {
+export async function startGlobalEventListener(api: OpencodeClient, mux: AdapterMux) {
   if (isListenerStarted) return;
   isListenerStarted = true;
   shouldStopListener = false;
@@ -98,12 +97,12 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
       console.log('[Listener] ✅ Connected to OpenCode Event Stream');
       retryCount = 0;
 
-      for await (const event of (events as any).stream) {
+      for await (const event of events.stream) {
         if (shouldStopListener) break;
 
         // 1) message.updated
         if (event.type === 'message.updated') {
-          const info = (event.properties as any)?.info;
+          const info = event.properties?.info;
           if (info?.id && info?.role) msgRole.set(info.id, info.role);
 
           if (info?.role === 'assistant' && info?.id && info?.sessionID) {
@@ -120,31 +119,31 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
             if (info.error) {
               if (isAbortedError(info.error)) {
                 markStatus(
-                  msgBuffers as any,
+                  msgBuffers,
                   mid,
                   'aborted',
-                  info.error?.data?.message || 'aborted'
+                  (info?.error?.data?.message as string) || 'aborted'
                 );
               } else if (isOutputLengthError(info.error)) {
-                markStatus(msgBuffers as any, mid, 'error', 'output too long');
+                markStatus(msgBuffers, mid, 'error', 'output too long');
               } else if (isApiError(info.error)) {
                 markStatus(
-                  msgBuffers as any,
+                  msgBuffers,
                   mid,
                   'error',
-                  info.error?.data?.message || 'api error'
+                  (info.error?.data?.message as string) || 'api error'
                 );
               } else {
                 markStatus(
-                  msgBuffers as any,
+                  msgBuffers,
                   mid,
                   'error',
-                  info.error?.data?.message || info.error?.name || 'error'
+                  (info.error?.data?.message as string) || info.error?.name || 'error'
                 );
               }
               await flushMessage(adapter, ctx.chatId, mid, true);
             } else if (info.finish || info.time?.completed) {
-              markStatus(msgBuffers as any, mid, 'done', info.finish || 'completed');
+              markStatus(msgBuffers, mid, 'done', info.finish || 'completed');
               await flushMessage(adapter, ctx.chatId, mid, true);
             }
           }
@@ -153,11 +152,11 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
 
         // 2) message.part.updated
         if (event.type === 'message.part.updated') {
-          const part: Part | undefined = (event.properties as any)?.part;
-          const delta: string | undefined = (event.properties as any)?.delta;
+          const part = event.properties?.part;
+          const delta: string | undefined = event.properties?.delta;
 
-          const sessionId = (part as any)?.sessionID;
-          const messageId = (part as any)?.messageID;
+          const sessionId = part?.sessionID;
+          const messageId = part?.messageID;
           if (!sessionId || !messageId || !part) continue;
 
           if (msgRole.get(messageId) === 'user') continue;
@@ -170,23 +169,19 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
           // session 内切换到新 assistant message：先 flush 旧的
           const prev = sessionActiveMsg.get(sessionId);
           if (prev && prev !== messageId) {
-            markStatus(msgBuffers as any, prev, 'done');
+            markStatus(msgBuffers, prev, 'done');
             await flushMessage(adapter, ctx.chatId, prev, true);
           }
           sessionActiveMsg.set(sessionId, messageId);
 
-          const buffer = getOrInitBuffer(msgBuffers as any, messageId);
+          const buffer = getOrInitBuffer(msgBuffers, messageId);
+
           applyPartToBuffer(buffer, part, delta);
 
           // step-finish：只作为状态 done 的信号之一（不覆盖 aborted/error）
           if (part.type === 'step-finish') {
             if (buffer.status === 'streaming') {
-              markStatus(
-                msgBuffers as any,
-                messageId,
-                'done',
-                (part as any).reason || 'step-finish'
-              );
+              markStatus(msgBuffers, messageId, 'done', part.reason || 'step-finish');
             }
           }
 
@@ -218,8 +213,8 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
 
         // 3) session.error：abort 最常在这里出现
         if (event.type === 'session.error') {
-          const sid = (event.properties as any)?.sessionID;
-          const err = (event.properties as any)?.error;
+          const sid = event.properties?.sessionID;
+          const err = event.properties?.error;
           if (!sid) continue;
 
           const ctx = sessionToCtx.get(sid);
@@ -229,13 +224,13 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
 
           if (ctx && adapter && mid) {
             if (isAbortedError(err)) {
-              markStatus(msgBuffers as any, mid, 'aborted', err?.data?.message || 'aborted');
+              markStatus(msgBuffers, mid, 'aborted', (err?.data?.message as string) || 'aborted');
             } else {
               markStatus(
-                msgBuffers as any,
+                msgBuffers,
                 mid,
                 'error',
-                err?.data?.message || err?.name || 'session.error'
+                (err?.data?.message as string) || err?.name || 'session.error'
               );
             }
             await flushMessage(adapter, ctx.chatId, mid, true);
@@ -245,7 +240,7 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
 
         // 4) session.idle：作为“本轮结束”的可靠信号
         if (event.type === 'session.idle') {
-          const sid = (event.properties as any)?.sessionID;
+          const sid = event.properties?.sessionID;
           if (!sid) continue;
 
           const ctx = sessionToCtx.get(sid);
@@ -258,7 +253,7 @@ export async function startGlobalEventListener(api: OpenCodeApi, mux: AdapterMux
             if (buf && (buf.status === 'aborted' || buf.status === 'error')) {
               await flushMessage(adapter, ctx.chatId, mid, true);
             } else {
-              markStatus(msgBuffers as any, mid, 'done', 'idle');
+              markStatus(msgBuffers, mid, 'done', 'idle');
               await flushMessage(adapter, ctx.chatId, mid, true);
             }
           }
@@ -298,7 +293,7 @@ export function stopGlobalEventListener() {
 /**
  * Incoming handler：每个平台传 adapterKey，自动绑定 session->adapterKey
  */
-export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapterKey: string) => {
+export const createIncomingHandler = (api: OpencodeClient, mux: AdapterMux, adapterKey: string) => {
   const adapter = mux.get(adapterKey);
   if (!adapter) throw new Error(`[Handler] Adapter not found: ${adapterKey}`);
 
@@ -310,9 +305,11 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
     const normalizedCommand =
       slash?.command === 'resume' || slash?.command === 'continue'
         ? 'sessions'
+        : slash?.command === 'summarize'
+        ? 'compact'
         : slash?.command === 'clear'
-          ? 'new'
-          : slash?.command;
+        ? 'new'
+        : slash?.command;
     const targetSessionId =
       normalizedCommand === 'sessions' && slash?.arguments
         ? slash.arguments.trim().split(/\s+/)[0]
@@ -322,6 +319,18 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
         ? slash.arguments.trim().split(/\s+/)[0]
         : null;
     const shouldCreateNew = normalizedCommand === 'new';
+    const unsupportedCommands = new Set([
+      'connect',
+      'details',
+      'editor',
+      'export',
+      'exit',
+      'quit',
+      'q',
+      'theme',
+      'themes',
+      'thinking',
+    ]);
 
     if (!slash && text.trim().toLowerCase() === 'ping') {
       await adapter.sendMessage(chatId, 'Pong! ⚡️');
@@ -335,20 +344,103 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
         reactionId = await adapter.addReaction(messageId, LOADING_EMOJI);
       }
 
-      let sessionId = sessionCache.get(cacheKey);
-      if (!sessionId || shouldCreateNew) {
+      const createNewSession = async () => {
         const uniqueTitle = `[${adapterKey}] Chat ${chatId.slice(
           -4
         )} [${new Date().toLocaleTimeString()}]`;
-        const res = await api.createSession({ body: { title: uniqueTitle } });
-        sessionId = (res as any)?.data?.id;
+          const res = await api.session.create({ body: { title: uniqueTitle } });
+        const sessionId = (res as any)?.data?.id;
         if (sessionId) {
           sessionCache.set(cacheKey, sessionId);
           sessionToAdapterKey.set(sessionId, adapterKey);
           sessionToCtx.set(sessionId, { chatId, senderId });
           chatAgent.delete(cacheKey);
         }
+        return sessionId;
+      };
+
+      const ensureSession = async () => {
+        let sessionId = sessionCache.get(cacheKey);
+        if (!sessionId) {
+          sessionId = await createNewSession();
+        }
+        if (!sessionId) throw new Error('Failed to init Session');
+        return sessionId;
+      };
+
+      const sendUnsupported = async () => {
+        await adapter.sendMessage(chatId, `❌ 命令 /${slash?.command} 暂不支持在聊天中使用。`);
+      };
+
+      if (slash) {
+        if (normalizedCommand === 'help') {
+          const res = await api.command.list();
+          const data = (res as any)?.data ?? res;
+          const list = Array.isArray(data) ? data : [];
+
+          const lines = [
+            '🧰 可用命令（聊天桥适配）：',
+            '/help /models /new /sessions /share /unshare /compact /init /agent',
+          ];
+          if (list.length > 0) {
+            lines.push('', '🧩 自定义命令（command.list）：');
+            list.forEach((cmd: any) => {
+              const desc = cmd?.description ? ` - ${cmd.description}` : '';
+              lines.push(`/${cmd?.name}${desc}`);
+            });
+          }
+          await adapter.sendMessage(chatId, lines.join('\n'));
+          return;
+        }
+
+        if (normalizedCommand === 'models') {
+          const res = await api.provider.list();
+          const data = (res as any)?.data ?? res;
+          const providers = data?.all ?? [];
+          if (!Array.isArray(providers) || providers.length === 0) {
+            await adapter.sendMessage(chatId, '暂无可用模型信息。');
+            return;
+          }
+          const lines = ['🧠 模型列表（按 Provider）：'];
+          providers.forEach((p: any) => {
+            const models = p?.models ? Object.keys(p.models) : [];
+            lines.push(`${p?.name || p?.id} (${p?.id})`);
+            lines.push(`Models: ${models.join(', ') || '-'}`);
+          });
+          await adapter.sendMessage(chatId, lines.join('\n'));
+          return;
+        }
+
+        if (normalizedCommand === 'agent' && targetAgent) {
+          chatAgent.set(cacheKey, targetAgent);
+          await adapter.sendMessage(chatId, `✅ 已切换 Agent: ${targetAgent}`);
+          return;
+        }
+
+        if (normalizedCommand === 'sessions' && !targetSessionId) {
+          const res = await api.session.list({});
+          const data = (res as any)?.data ?? res;
+          const sessions = Array.isArray(data) ? data : [];
+          if (sessions.length === 0) {
+            await adapter.sendMessage(chatId, '暂无会话，请使用 /new 创建。');
+            return;
+          }
+          const lines = ['📚 会话列表（回复 /sessions <id> 切换）：'];
+          sessions.slice(0, 20).forEach((s: any, idx: number) => {
+            const updated = s?.time?.updated ? new Date(s.time.updated).toLocaleString() : '-';
+            lines.push(`${idx + 1}. ${s?.title || 'Untitled'} | ${s?.id} | ${updated}`);
+          });
+          await adapter.sendMessage(chatId, lines.join('\n'));
+          return;
+        }
+
+        if (unsupportedCommands.has(normalizedCommand || '')) {
+          await sendUnsupported();
+          return;
+        }
+
         if (shouldCreateNew) {
+          const sessionId = await createNewSession();
           console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🆕 New Session Bound.`);
           if (sessionId) {
             await adapter.sendMessage(chatId, `✅ 已切换到新会话: ${sessionId}`);
@@ -357,42 +449,68 @@ export const createIncomingHandler = (api: OpenCodeApi, mux: AdapterMux, adapter
           }
           return;
         }
-      }
 
-      if (!sessionId) throw new Error('Failed to init Session');
+        const sessionId = await ensureSession();
 
-      // ✅ 绑定：这个 session 的输出回到哪个平台
-      sessionToAdapterKey.set(sessionId, adapterKey);
-      sessionToCtx.set(sessionId, { chatId, senderId });
+        // ✅ 绑定：这个 session 的输出回到哪个平台
+        sessionToAdapterKey.set(sessionId, adapterKey);
+        sessionToCtx.set(sessionId, { chatId, senderId });
 
-      if (slash) {
-        await api.commandSession({
-          path: { id: sessionId },
-          body: { command: slash.command, arguments: slash.arguments },
-        });
-
-        if (targetSessionId) {
+        if (normalizedCommand === 'sessions' && targetSessionId) {
           sessionCache.set(cacheKey, targetSessionId);
           sessionToAdapterKey.set(targetSessionId, adapterKey);
           sessionToCtx.set(targetSessionId, { chatId, senderId });
           chatAgent.delete(cacheKey);
           await adapter.sendMessage(chatId, `✅ 已切换到会话: ${targetSessionId}`);
+          return;
         }
 
-        if (targetAgent) {
-          chatAgent.set(cacheKey, targetAgent);
-          await adapter.sendMessage(chatId, `✅ 已切换 Agent: ${targetAgent}`);
+        if (normalizedCommand === 'share') {
+          const res = await api.session.share({ path: { id: sessionId } });
+          const data = (res as any)?.data ?? res;
+          const url = data?.share?.url;
+          await adapter.sendMessage(chatId, url ? `✅ 分享链接: ${url}` : '✅ 已分享会话。');
+          return;
         }
-      } else {
-        const agent = chatAgent.get(cacheKey);
-        await api.promptSession({
+
+        if (normalizedCommand === 'unshare') {
+          await api.session.unshare({ path: { id: sessionId } });
+          await adapter.sendMessage(chatId, '✅ 已取消分享。');
+          return;
+        }
+
+        if (normalizedCommand === 'compact') {
+          await api.session.summarize({ path: { id: sessionId } });
+          await adapter.sendMessage(chatId, '✅ 已触发会话压缩。');
+          return;
+        }
+
+        if (normalizedCommand === 'init') {
+          await api.session.init({ path: { id: sessionId } });
+          await adapter.sendMessage(chatId, '✅ 已触发初始化（AGENTS.md）。');
+          return;
+        }
+
+        await api.session.command({
           path: { id: sessionId },
-          body: { parts: [{ type: 'text', text }], ...(agent ? { agent } : {}) },
+          body: { command: slash.command, arguments: slash.arguments },
         });
+        console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🚀 Command /${slash.command} Sent.`);
+        return;
       }
 
-      const mode = slash ? `Command /${slash.command}` : 'Prompt';
-      console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🚀 ${mode} Sent.`);
+      const sessionId = await ensureSession();
+      // ✅ 绑定：这个 session 的输出回到哪个平台
+      sessionToAdapterKey.set(sessionId, adapterKey);
+      sessionToCtx.set(sessionId, { chatId, senderId });
+
+      const agent = chatAgent.get(cacheKey);
+      await api.session.prompt({
+        path: { id: sessionId },
+        body: { parts: [{ type: 'text', text }], ...(agent ? { agent } : {}) },
+      });
+
+      console.log(`[Bridge] [${adapterKey}] [Session: ${sessionId}] 🚀 Prompt Sent.`);
     } catch (err: any) {
       console.error(`[Bridge] ❌ [${adapterKey}] Error:`, err);
       await adapter.sendMessage(chatId, `❌ Error: ${err?.message || String(err)}`);

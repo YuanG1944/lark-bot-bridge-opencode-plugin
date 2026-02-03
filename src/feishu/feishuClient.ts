@@ -19,9 +19,7 @@ function looksLikeJsonCard(s: string) {
     const obj = JSON.parse(trimmed);
     // 飞书卡片特征：必须是对象，通常有 elements 数组
     return (
-      !!obj &&
-      typeof obj === 'object' &&
-      (Array.isArray((obj as any).elements) || (obj as any).card_link)
+      !!obj && typeof obj === 'object' && (Array.isArray(obj.elements) || (obj as any).card_link)
     );
   } catch {
     return false;
@@ -95,7 +93,7 @@ export class FeishuClient {
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
       try {
         const obj = JSON.parse(trimmed);
-        if (obj && typeof obj === 'object' && Array.isArray((obj as any).elements)) {
+        if (obj && typeof obj === 'object' && Array.isArray(obj.elements)) {
           return trimmed;
         }
       } catch {
@@ -186,10 +184,10 @@ export class FeishuClient {
 
     const dispatcher = new lark.EventDispatcher({}).register({
       'im.message.receive_v1': async data => {
-        const { message } = data;
+        const { message, sender } = data;
         const messageId = message.message_id;
         const chatId = message.chat_id;
-        const senderId = (message as any).sender?.sender_id?.open_id || '';
+        const senderId = sender?.sender_id?.open_id || '';
 
         if (this.isMessageProcessed(messageId)) return;
 

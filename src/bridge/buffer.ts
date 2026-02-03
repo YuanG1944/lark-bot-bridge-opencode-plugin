@@ -1,5 +1,5 @@
 // src/bridge/buffer.ts
-import type { Part, ToolPart, ToolState } from '@opencode-ai/sdk';
+import type { ToolPart, ToolState } from '@opencode-ai/sdk';
 import {
   SAFE_MAX_REASONING,
   SAFE_MAX_TEXT,
@@ -7,6 +7,7 @@ import {
   SAFE_MAX_TOOL_OUTPUT,
   UPDATE_INTERVAL,
 } from '../constants';
+import { Part } from '@opencode-ai/sdk';
 
 export type BufferStatus = 'streaming' | 'done' | 'aborted' | 'error';
 

@@ -64,12 +64,12 @@ After validation and real-world usage, it has evolved into a **general-purpose m
 
 ## ✅ Slash Command Support
 
-This plugin **passes through any message starting with `/`** to OpenCode as a `session.command`.
-That means **all built-in slash commands** and **any custom commands** you define are supported. citeturn1view0turn0search1
+This plugin **implements key slash commands via OpenCode APIs**, and **falls back to `session.command`** for custom commands.
+UI-only commands (theme/editor/exit, etc.) are **not supported in chat**.
 
 ### Built-in Slash Commands (TUI)
 
-From the official TUI docs, the built-in commands include: citeturn1view0
+From the official TUI docs, the built-in commands include:
 
 * `/connect`
 * `/compact` (alias: `/summarize`)
@@ -89,18 +89,41 @@ From the official TUI docs, the built-in commands include: citeturn1view0�
 * `/undo`
 * `/unshare`
 
+### Bridge-Handled Commands
+
+These are implemented directly against OpenCode APIs:
+
+* `/help` → list custom commands
+* `/models` → list providers and models
+* `/new` → create and bind to a new session
+* `/sessions` → list sessions (reply with `/sessions <id>` to bind)
+* `/share` / `/unshare`
+* `/compact` (alias `/summarize`)
+* `/init`
+* `/agent <name>` → bind agent for future prompts
+
+### UI-Only Commands (Not Supported in Chat)
+
+* `/connect`
+* `/details`
+* `/editor`
+* `/export`
+* `/exit` (`/quit`, `/q`)
+* `/theme`
+* `/thinking`
+
 ### Custom Commands
 
 Custom commands are supported via:
 
 * `opencode.json` under `command`, or
-* `.opencode/commands/*.md` files. citeturn0search1
+* `.opencode/commands/*.md` files.
 
 ### Session / Agent Switching
 
-Session switching via `/sessions` is fully supported. The list and follow-up choices are returned to the chat, and you can reply with `/sessions <id>` to bind this chat to the chosen session. citeturn1view0
+Session switching via `/sessions` is fully supported. The list and follow-up choices are returned to the chat, and you can reply with `/sessions <id>` to bind this chat to the chosen session.
 
-If your OpenCode setup provides slash commands for agent switching, they will also work here, since **all `/` commands are forwarded without interception**. citeturn1view0turn0search1
+If your OpenCode setup provides additional slash commands, they will still be forwarded via `session.command` unless explicitly handled above.
 
 ---
 
