@@ -247,6 +247,11 @@ export class FeishuClient {
     content: Record<string, string>
   ): Promise<boolean> {
     try {
+      console.log(
+        `[Feishu] 📤 sendMediaMessage type=${msgType} chat=${chatId} content=${JSON.stringify(
+          content
+        )}`
+      );
       const res = await this.apiClient.im.message.create({
         params: { receive_id_type: 'chat_id' },
         data: {
@@ -269,6 +274,17 @@ export class FeishuClient {
     const { url, filename } = file;
     if (!url) return false;
 
+    console.log(
+      `[Feishu] 📎 sendFileAttachment url=${url.slice(0, 120)}${
+        url.length > 120 ? '...' : ''
+      } filename=${filename || ''} mime=${file.mime || ''}`
+    );
+    console.log(
+      `[Feishu] 🌐 proxy http_proxy=${process.env.http_proxy || ''} https_proxy=${
+        process.env.https_proxy || ''
+      } NO_PROXY=${process.env.NO_PROXY || process.env.no_proxy || ''}`
+    );
+
     let buffer: Buffer | null = null;
     let mime = file.mime || '';
     let finalName = filename || '';
@@ -281,13 +297,18 @@ export class FeishuClient {
       }
       buffer = decoded.buffer;
       if (!mime) mime = decoded.mime;
+      console.log(`[Feishu] ✅ data URL decoded size=${buffer.length} mime=${mime}`);
     } else if (url.startsWith('http://') || url.startsWith('https://')) {
       const maxBytes = mime.startsWith('image/') ? 10 * 1024 * 1024 : 30 * 1024 * 1024;
       try {
+        console.log(`[Feishu] ⬇️ downloading url (max=${maxBytes} bytes)`);
         const res = await this.fetchUrlToBuffer(url, maxBytes);
         buffer = res.buffer;
         if (!mime) mime = res.mime || '';
         if (!finalName) finalName = res.filename || '';
+        console.log(
+          `[Feishu] ✅ download ok size=${buffer.length} mime=${mime} filename=${finalName}`
+        );
       } catch (e) {
         console.error('[Feishu] ❌ Download file failed:', e);
         return false;
@@ -306,10 +327,14 @@ export class FeishuClient {
         return false;
       }
       try {
+        console.log(
+          `[Feishu] ⬆️ uploading image size=${buffer.length} mime=${mime} name=${finalName}`
+        );
         const resp = await this.apiClient.im.image.create({
           data: { image_type: 'message', image: buffer },
         });
         const imageKey = resp?.image_key;
+        console.log(`[Feishu] ✅ upload image ok image_key=${imageKey || ''}`);
         if (!imageKey) return false;
         return this.sendMediaMessage(chatId, 'image', { image_key: imageKey });
       } catch (e) {
@@ -325,6 +350,9 @@ export class FeishuClient {
 
     try {
       const fileType = this.inferFileType(mime, finalName);
+      console.log(
+        `[Feishu] ⬆️ uploading file size=${buffer.length} mime=${mime} type=${fileType} name=${finalName}`
+      );
       const resp = await this.apiClient.im.file.create({
         data: {
           file_type: fileType,
@@ -333,6 +361,7 @@ export class FeishuClient {
         },
       });
       const fileKey = resp?.file_key;
+      console.log(`[Feishu] ✅ upload file ok file_key=${fileKey || ''}`);
       if (!fileKey) return false;
       return this.sendMediaMessage(chatId, 'file', { file_key: fileKey });
     } catch (e) {
