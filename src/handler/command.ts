@@ -3,8 +3,6 @@ import type { FilePartInput, OpencodeClient, TextPartInput } from '@opencode-ai/
 import { DEFAULT_MAX_FILE_MB, DEFAULT_MAX_FILE_RETRY } from '../utils';
 
 type SessionListItem = { id: string; title: string };
-type AgentListItem = { id: string; name: string };
-
 export type CommandContext = {
   api: OpencodeClient;
   adapterKey: string;
@@ -21,7 +19,6 @@ export type CommandContext = {
   sessionToCtx: Map<string, { chatId: string; senderId: string }>;
   chatAgent: Map<string, string>;
   chatSessionList: Map<string, Array<SessionListItem>>;
-  chatAgentList: Map<string, Array<AgentListItem>>;
   chatMaxFileSizeMb: Map<string, number>;
   chatMaxFileRetry: Map<string, number>;
   ensureSession: () => Promise<string>;
@@ -41,21 +38,40 @@ async function resolveAgentName(
     const data = (res as any)?.data ?? res;
     const list = Array.isArray(data) ? data : [];
     if (list.length === 0) return null;
-    const lower = name.toLowerCase();
+    const query = name.trim().toLowerCase();
+    const tokens = query.split(/\s+/).filter(Boolean);
 
-    const exact = list.find((a: any) => a?.name === name || a?.id === name);
-    if (exact) return { id: exact.id, name: exact.name };
+    const scoreCandidate = (candidate: string): number => {
+      const lower = candidate.toLowerCase();
+      if (lower === query) return 100;
+      if (lower.startsWith(query)) return 80;
+      if (tokens.length > 0 && tokens.every(t => lower.includes(t))) return 60;
+      if (lower.includes(query)) return 40;
+      return -1;
+    };
 
-    const fuzzy = list.find(
-      (a: any) =>
-        String(a?.name || '')
-          .toLowerCase()
-          .includes(lower) ||
-        String(a?.id || '')
-          .toLowerCase()
-          .includes(lower)
-    );
-    if (fuzzy) return { id: fuzzy.id, name: fuzzy.name };
+    let best: { id: string; name: string; score: number; matchLen: number } | null = null;
+    for (const a of list) {
+      const nameVal = String(a?.name || '');
+      const idVal = String(a?.id || '');
+      const nameScore = nameVal ? scoreCandidate(nameVal) : -1;
+      const idScore = idVal ? scoreCandidate(idVal) : -1;
+      const score = Math.max(nameScore, idScore);
+      if (score < 0) continue;
+      const matchLen = Math.min(
+        nameScore >= idScore ? nameVal.length : idVal.length,
+        200
+      );
+      if (
+        !best ||
+        score > best.score ||
+        (score === best.score && matchLen < best.matchLen)
+      ) {
+        best = { id: a?.id, name: a?.name, score, matchLen };
+      }
+    }
+
+    if (best) return { id: best.id, name: best.name };
 
     return null;
   } catch {
@@ -78,7 +94,6 @@ export async function handleSlashCommand(ctx: CommandContext): Promise<boolean> 
     sessionToCtx,
     chatAgent,
     chatSessionList,
-    chatAgentList,
     chatMaxFileSizeMb,
     ensureSession,
     createNewSession,
@@ -105,7 +120,7 @@ export async function handleSlashCommand(ctx: CommandContext): Promise<boolean> 
     lines.push('/unshare - 取消分享');
     lines.push('/compact - 压缩/总结当前会话');
     lines.push('/init - 初始化项目（生成 AGENTS.md）');
-    lines.push('/agent <name> - 切换 Agent');
+    lines.push('/agent <name> - 切换 Agent（支持模糊匹配）');
 
     if (list.length > 0) {
       lines.push('### Custom Commands');
@@ -188,19 +203,6 @@ export async function handleSlashCommand(ctx: CommandContext): Promise<boolean> 
   }
 
   if (normalizedCommand === 'agent' && targetAgent) {
-    if (/^\d+$/.test(targetAgent)) {
-      const list = chatAgentList.get(cacheKey) || [];
-      const idx = Number(targetAgent) - 1;
-      if (idx < 0 || idx >= list.length) {
-        await sendCommandMessage(`❌ 无效序号: ${targetAgent}`);
-        return true;
-      }
-      const agent = list[idx];
-      chatAgent.set(cacheKey, agent.name || agent.id);
-      await sendCommandMessage(`✅ 已切换 Agent: ${agent.name || agent.id}`);
-      return true;
-    }
-
     const agent = await resolveAgentName(api, targetAgent);
     if (!agent) {
       await sendCommandMessage(`❌ 未找到 Agent: ${targetAgent}`);
@@ -219,14 +221,14 @@ export async function handleSlashCommand(ctx: CommandContext): Promise<boolean> 
       await sendCommandMessage('暂无可用 Agent。');
       return true;
     }
-    const agents = list.slice(0, 20).map((a: any) => ({
-      id: a?.id,
-      name: a?.name || a?.id,
-    }));
-    chatAgentList.set(cacheKey, agents);
-    const lines = ['## Command', '### Agents', '请输入 /agent <序号> 切换：'];
-    agents.forEach((a, idx) => {
-      lines.push(`${idx + 1}. ${a.name}`);
+    const agents = list.slice(0, 20).map((a: any) => a?.name || a?.id).filter(Boolean);
+    const lines = [
+      '## Command',
+      '### Agents',
+      '请输入 /agent <name> 切换（支持模糊匹配）：',
+    ];
+    agents.forEach(a => {
+      lines.push(`- ${a}`);
     });
     await sendCommandMessage(lines.join('\n'));
     return true;
