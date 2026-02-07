@@ -20,3 +20,5 @@ export const SAFE_MAX_REASONING = 8000;
 export const SAFE_MAX_TEXT = 24000;
 export const SAFE_MAX_TOOL_INPUT = 4000;
 export const SAFE_MAX_TOOL_OUTPUT = 8000;
+
+export const BRIDGE_FEISHU_RESPONSE_TIMEOUT_MS = 60000;

@@ -55,3 +55,8 @@ export function getUpdateIntervalByAdapter(adapterKey?: string): number {
 export function isBridgeAgentId(value: string): boolean {
   return BRIDGE_AGENT_IDS.includes(value as (typeof BRIDGE_AGENT_IDS)[number]);
 }
+export function sanitizeTemplateMarkers(text: string): string {
+  // Feishu interactive cards treat `{{...}}` as template variables.
+  // Runtime content may contain these literally (e.g. code snippets), which causes 201008.
+  return text.replace(/\{\{/g, '{ {').replace(/\}\}/g, '} }');
+}

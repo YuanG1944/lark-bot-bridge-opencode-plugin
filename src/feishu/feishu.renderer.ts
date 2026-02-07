@@ -1,4 +1,5 @@
 // src/feishu/feishu.renderer.ts
+import { sanitizeTemplateMarkers } from '../utils';
 
 type FeishuCard = {
   config?: { wide_screen_mode?: boolean };
@@ -16,6 +17,23 @@ export type RenderedFile = {
 
 function trimSafe(s: string) {
   return (s || '').trim();
+}
+
+function sanitizeCardValue<T>(value: T): T {
+  if (typeof value === 'string') {
+    return sanitizeTemplateMarkers(value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map(v => sanitizeCardValue(v)) as T;
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      out[k] = sanitizeCardValue(v);
+    }
+    return out as T;
+  }
+  return value;
 }
 
 function larkMd(content: string) {
@@ -492,7 +510,7 @@ export function renderFeishuCardFromHandlerMarkdown(handlerMarkdown: string): st
     elements: elements.filter(Boolean),
   };
 
-  return JSON.stringify(card);
+  return JSON.stringify(sanitizeCardValue(card));
 }
 
 export class FeishuRenderer {

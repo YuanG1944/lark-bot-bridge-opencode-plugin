@@ -19,6 +19,8 @@ import {
 import { FeishuRenderer } from './feishu.renderer';
 import { fetchFeishuResourceToBuffer } from './patch';
 import { LoggerLevel } from '@larksuiteoapi/node-sdk';
+import { BRIDGE_FEISHU_RESPONSE_TIMEOUT_MS } from '../constants';
+import { sanitizeTemplateMarkers } from '../utils';
 
 function clip(s: string, n = 2000) {
   if (!s) return '';
@@ -38,6 +40,44 @@ function looksLikeJsonCard(s: string) {
   } catch {
     return false;
   }
+}
+
+const FEISHU_RESPONSE_TIMEOUT_MS = (() => {
+  const raw = Number(BRIDGE_FEISHU_RESPONSE_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : BRIDGE_FEISHU_RESPONSE_TIMEOUT_MS;
+})();
+
+function isUnresolvedVariableError(payload: unknown): boolean {
+  const stack: unknown[] = [payload];
+  while (stack.length > 0) {
+    const cur = stack.pop();
+    if (cur == null) continue;
+
+    if (typeof cur === 'string') {
+      if (
+        /unresolved variable|card contains unresolved variable|errcode:\s*201008|201008/i.test(cur)
+      ) {
+        return true;
+      }
+      continue;
+    }
+
+    if (Array.isArray(cur)) {
+      for (const v of cur) stack.push(v);
+      continue;
+    }
+
+    if (typeof cur === 'object') {
+      const rec = cur as Record<string, unknown>;
+      const code = rec.code;
+      if (code === 230099) return true;
+
+      for (const v of Object.values(rec)) stack.push(v);
+      continue;
+    }
+  }
+
+  return false;
 }
 
 type MentionLike = { key?: string };
@@ -722,10 +762,121 @@ export class FeishuClient {
       elements: [
         {
           tag: 'div',
-          text: { tag: 'lark_md', content: raw },
+          text: { tag: 'lark_md', content: sanitizeTemplateMarkers(raw) },
         },
       ],
     });
+  }
+
+  private extractPlainTextForFallback(input: string): string {
+    const raw = (input || '').trim();
+    if (!raw) return 'Message';
+
+    const chunks: string[] = [];
+
+    const walk = (node: unknown) => {
+      if (node == null) return;
+      if (typeof node === 'string') {
+        const s = node.trim();
+        if (s) chunks.push(s);
+        return;
+      }
+      if (Array.isArray(node)) {
+        for (const item of node) walk(item);
+        return;
+      }
+      if (typeof node === 'object') {
+        const rec = node as Record<string, unknown>;
+        for (const [k, v] of Object.entries(rec)) {
+          if (k === 'content' && typeof v === 'string') {
+            const s = v.trim();
+            if (s) chunks.push(s);
+            continue;
+          }
+          walk(v);
+        }
+      }
+    };
+
+    if (raw.startsWith('{') && raw.endsWith('}')) {
+      try {
+        walk(JSON.parse(raw));
+      } catch {
+        // ignore parse error and fallback to raw text
+      }
+    }
+
+    if (chunks.length === 0) return raw;
+
+    const text = chunks.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+    return text || raw;
+  }
+
+  private async sendTextMessage(chatId: string, text: string): Promise<string | null> {
+    const fallbackText = this.extractPlainTextForFallback(text);
+    try {
+      const res = await this.withResponseTimeout(
+        this.runWithTenantRetry(options =>
+          this.apiClient.im.message.create(
+            {
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'text',
+                content: JSON.stringify({ text: fallbackText }),
+              },
+            },
+            options,
+          ),
+        ),
+        'sendMessage(text-fallback)',
+      );
+      if (res.code === 0 && res.data?.message_id) return res.data.message_id;
+      bridgeLogger.error('[Feishu] ❌ Text fallback send failed:', res);
+      return null;
+    } catch (e) {
+      bridgeLogger.error('[Feishu] ❌ Text fallback send failed:', e);
+      return null;
+    }
+  }
+
+  private async patchTextMessage(messageId: string, text: string): Promise<boolean> {
+    const fallbackText = this.extractPlainTextForFallback(text);
+    try {
+      const res = await this.withResponseTimeout(
+        this.runWithTenantRetry(options =>
+          this.apiClient.im.message.patch(
+            {
+              path: { message_id: messageId },
+              data: {
+                content: JSON.stringify({ text: fallbackText }),
+              },
+            },
+            options,
+          ),
+        ),
+        'editMessage(text-fallback)',
+      );
+      return res.code === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  private async withResponseTimeout<T>(promise: Promise<T>, label: string): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    try {
+      return await Promise.race([
+        promise,
+        new Promise<T>((_, reject) => {
+          timer = setTimeout(() => {
+            reject(new Error(`[Feishu] ${label} timeout after ${FEISHU_RESPONSE_TIMEOUT_MS}ms`));
+          }, FEISHU_RESPONSE_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   async sendMessage(chatId: string, text: string): Promise<string | null> {
@@ -734,23 +885,38 @@ export class FeishuClient {
 
       const finalContent = isCard ? text : this.makeCard(text);
 
-      const res = await this.runWithTenantRetry(options =>
-        this.apiClient.im.message.create(
-          {
-            params: { receive_id_type: 'chat_id' },
-            data: {
-              receive_id: chatId,
-              msg_type: 'interactive', // 永远使用 interactive
-              content: finalContent,
+      const res = await this.withResponseTimeout(
+        this.runWithTenantRetry(options =>
+          this.apiClient.im.message.create(
+            {
+              params: { receive_id_type: 'chat_id' },
+              data: {
+                receive_id: chatId,
+                msg_type: 'interactive', // 永远使用 interactive
+                content: finalContent,
+              },
             },
-          },
-          options,
+            options,
+          ),
         ),
+        'sendMessage(interactive)',
       );
       if (res.code === 0 && res.data?.message_id) return res.data.message_id;
+      if (isUnresolvedVariableError(res)) {
+        bridgeLogger.warn(
+          '[Feishu] ⚠️ Card contains unresolved variable (201008), fallback to text message',
+        );
+        return await this.sendTextMessage(chatId, text);
+      }
       bridgeLogger.error('[Feishu] ❌ Send failed:', res);
       return null;
     } catch (e) {
+      if (isUnresolvedVariableError(e)) {
+        bridgeLogger.warn(
+          '[Feishu] ⚠️ Card contains unresolved variable (201008), fallback to text message',
+        );
+        return await this.sendTextMessage(chatId, text);
+      }
       bridgeLogger.error('[Feishu] ❌ Failed to send:', e);
       return null;
     }
@@ -758,20 +924,39 @@ export class FeishuClient {
 
   async editMessage(chatId: string, messageId: string, text: string): Promise<boolean> {
     try {
-      const res = await this.runWithTenantRetry(options =>
-        this.apiClient.im.message.patch(
-          {
-            path: { message_id: messageId },
-            data: {
-              content: text,
+      const res = await this.withResponseTimeout(
+        this.runWithTenantRetry(options =>
+          this.apiClient.im.message.patch(
+            {
+              path: { message_id: messageId },
+              data: {
+                content: text,
+              },
             },
-          },
-          options,
+            options,
+          ),
         ),
+        'editMessage(interactive)',
       );
 
+      if (res.code !== 0 && isUnresolvedVariableError(res)) {
+        bridgeLogger.warn(
+          `[Feishu] ⚠️ Card edit unresolved variable (201008), fallback to text patch msg=${messageId}`,
+        );
+        return await this.patchTextMessage(messageId, text);
+      }
+
       return res.code === 0;
-    } catch {
+    } catch (e) {
+      if (isUnresolvedVariableError(e)) {
+        bridgeLogger.warn(
+          `[Feishu] ⚠️ Card edit unresolved variable (201008), fallback to text patch msg=${messageId}`,
+        );
+        return await this.patchTextMessage(messageId, text);
+      }
+      bridgeLogger.warn(
+        `[Feishu] ⚠️ editMessage failed: msg=${messageId} reason=${getErrorMessage(e) || 'unknown'}`,
+      );
       return false;
     }
   }
